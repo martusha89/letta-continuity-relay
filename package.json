@@ -45,6 +45,7 @@
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/node": "^20.11.16",
+    "railway": "^3.11.0",
     "typescript": "^5.3.3"
   }
 }
