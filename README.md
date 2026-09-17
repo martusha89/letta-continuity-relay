@@ -11,6 +11,11 @@ each reply back to the exact platform/channel that originated it.
 > a cloud-hosted agent and must be regression-tested after every Letta Code
 > upgrade.
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template/OpRbiK)
+
+> The Railway template is currently **unpublished and experimental**. The link
+> is shareable, but it has not been submitted to Railway's template marketplace.
+
 ## What the template deploys
 
 ```text
@@ -46,8 +51,9 @@ Telegram or Discord bot token already running in another listener.
 
 ## Railway deployment
 
-Use the unpublished template link supplied with the release. Railway will ask
-only for the credentials and IDs it cannot create safely:
+Open the [unpublished Letta Continuity Relay
+template](https://railway.com/new/template/OpRbiK). Railway will ask only for
+the credentials and IDs it cannot create safely:
 
 - `LETTA_API_KEY`
 - `LETTA_AGENT_ID`
