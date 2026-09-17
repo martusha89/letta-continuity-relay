@@ -14,9 +14,9 @@ RUN npm install --global @letta-ai/letta-code@0.32.12
 
 WORKDIR /app
 
-COPY deploy/continuity-listener/entrypoint.mjs /app/entrypoint.mjs
-COPY deploy/continuity-listener/channel-reply-route-guard.ts /app/channel-reply-route-guard.ts
-COPY letta-channel/continuity-discord/plugin.mjs /app/continuity-discord/plugin.mjs
+COPY entrypoint.mjs /app/entrypoint.mjs
+COPY channel-reply-route-guard.ts /app/channel-reply-route-guard.ts
+COPY continuity-discord/plugin.mjs /app/continuity-discord/plugin.mjs
 
 ENV NODE_ENV=production \
     LETTA_BASE_URL=https://api.letta.com \

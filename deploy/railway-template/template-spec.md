@@ -14,11 +14,12 @@ volume:
 | Resource | Source | Dockerfile | Public network | Replicas |
 | --- | --- | --- | --- | --- |
 | `discord-bridge` | repository root | `Dockerfile` | enabled | **1** |
-| `continuity-listener` | repository root | `deploy/continuity-listener/Dockerfile` | not required | **1** |
+| `continuity-listener` | `deploy/continuity-listener` | `Dockerfile` | not required | **1** |
 | `continuity-state` | Railway volume | mount on listener at `/root` | n/a | n/a |
 
-Do not set a service root directory. Both Dockerfiles require the repository
-root as their build context.
+The listener service is intentionally self-contained below its root directory
+so Railway templates retain the correct build context without relying on a
+custom Dockerfile path that template generation may omit.
 
 The bridge owns the only Discord Gateway connection. The listener owns the
 only Telegram poller and the only long-poll consumer of the bridge queue.
@@ -155,15 +156,16 @@ template documentation:
 1. In Railway, open **Workspace Settings → Templates → New Template**.
 2. Add the repository as a GitHub source twice. Name the services exactly
    `discord-bridge` and `continuity-listener`.
-3. Leave both service root directories empty so the repository root remains
-   the Docker build context.
+3. Leave `discord-bridge` at the repository root. Set
+   `continuity-listener`'s service root directory to
+   `deploy/continuity-listener`.
 4. For `discord-bridge`, select the root `Dockerfile`, enable HTTP public
    networking, click **Generate Domain**, set `/ready` plus a 120-second
    Healthcheck Timeout, and add the bridge variables above.
-5. For `continuity-listener`, set the Dockerfile path to
-   `deploy/continuity-listener/Dockerfile`, set `/ready` plus a 180-second
-   Healthcheck Timeout, and add the listener variables/references above. Public
-   networking is unnecessary for this service.
+5. For `continuity-listener`, use the `Dockerfile` inside its service root, set
+   `/ready` plus a 180-second Healthcheck Timeout, and add the listener
+   variables/references above. Public networking is unnecessary for this
+   service.
 6. Add a Railway volume named `continuity-state`, attach it only to
    `continuity-listener`, and mount it at `/root`.
 7. Confirm both services are fixed at one replica. Mark the four credentials

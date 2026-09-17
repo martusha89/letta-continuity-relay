@@ -11,7 +11,7 @@ import {
   ensureThreadRoute,
   mapBridgeEvent,
   parseAccountConfig,
-} from "../letta-channel/continuity-discord/plugin.mjs";
+} from "../deploy/continuity-listener/continuity-discord/plugin.mjs";
 
 const CHANNEL = "222222222222222222";
 const MESSAGE = "333333333333333333";
@@ -100,7 +100,7 @@ test("custom channel plugin derives a portable channel identity and prefers rout
   const directory = join(root, "continuity-discord");
   await mkdir(directory);
   const pluginPath = join(directory, "plugin.mjs");
-  await copyFile(join(process.cwd(), "letta-channel", "continuity-discord", "plugin.mjs"), pluginPath);
+  await copyFile(join(process.cwd(), "deploy", "continuity-listener", "continuity-discord", "plugin.mjs"), pluginPath);
   const parent = "555555555555555555";
   const thread = "666666666666666666";
   const fallbackThread = "777777777777777777";

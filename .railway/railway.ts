@@ -44,10 +44,13 @@ export default defineRailway(() => {
   });
 
   const listener = service("continuity-listener", {
-    source: github("martusha89/letta-continuity-relay", { branch: "main" }),
+    source: github("martusha89/letta-continuity-relay", {
+      branch: "main",
+      rootDirectory: "deploy/continuity-listener",
+    }),
     build: {
       builder: "DOCKERFILE",
-      dockerfilePath: "deploy/continuity-listener/Dockerfile",
+      dockerfilePath: "Dockerfile",
     },
     healthcheck: "/ready",
     healthcheckTimeout: 180,

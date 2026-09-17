@@ -8,7 +8,7 @@ import { spawnSync } from "node:child_process";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const ENTRYPOINT = join(ROOT, "deploy", "continuity-listener", "entrypoint.mjs");
-const PLUGIN = join(ROOT, "letta-channel", "continuity-discord", "plugin.mjs");
+const PLUGIN = join(ROOT, "deploy", "continuity-listener", "continuity-discord", "plugin.mjs");
 const GUARD = join(ROOT, "deploy", "continuity-listener", "channel-reply-route-guard.ts");
 const AGENT_ID = "agent-11111111-1111-4111-8111-111111111111";
 const FIRST_CHANNEL = "222222222222222222";

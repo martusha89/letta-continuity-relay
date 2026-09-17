@@ -18,18 +18,16 @@ The listener is deliberately single-purpose:
 
 ## Railway service shape
 
-Build this service from the repository root with:
+Build this service with its self-contained listener directory as the service
+root:
 
 ```text
-Dockerfile path: deploy/continuity-listener/Dockerfile
+Root directory:  deploy/continuity-listener
+Dockerfile path: Dockerfile
 Volume mount:    /root
 Replicas:        1
 Healthcheck:     /ready
 ```
-
-Do not set the Railway service root directory to
-`deploy/continuity-listener`; the Docker build context must remain the
-repository root so the image can copy `letta-channel/continuity-discord/plugin.mjs`.
 
 The separate Discord bridge service should use the repository root
 `Dockerfile` and expose its HTTP port. Prefer Railway private networking from

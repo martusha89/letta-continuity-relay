@@ -127,7 +127,7 @@ uses a different secret and remains on Railway's private network.
 npm ci
 npm test
 docker build -t continuity-discord-bridge .
-docker build -f deploy/continuity-listener/Dockerfile -t continuity-listener .
+docker build -f deploy/continuity-listener/Dockerfile -t continuity-listener deploy/continuity-listener
 ```
 
 CI tests Node 20 and 22 and builds both images. The listener itself pins Node
