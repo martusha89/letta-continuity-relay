@@ -1,0 +1,50 @@
+{
+  "name": "letta-continuity-relay",
+  "version": "0.2.0",
+  "description": "A secure Railway relay connecting Telegram and Discord to one existing Letta agent conversation.",
+  "type": "module",
+  "main": "build/index.js",
+  "bin": {
+    "continuity-discord-bridge": "build/index.js"
+  },
+  "files": [
+    "build",
+    "README.md",
+    "LICENSE",
+    "config.example.json",
+    ".env.example"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node build/index.js",
+    "dev": "tsc -w",
+    "test": "npm run build && node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "letta",
+    "telegram",
+    "discord",
+    "railway",
+    "mcp",
+    "ai-agent",
+    "continuity"
+  ],
+  "author": "Marta Varen",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "discord.js": "^14.14.1",
+    "dotenv": "^16.4.7",
+    "express": "^5.2.1",
+    "ffmpeg-static": "^5.2.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^20.11.16",
+    "typescript": "^5.3.3"
+  }
+}

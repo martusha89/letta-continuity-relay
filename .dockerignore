@@ -1,0 +1,9 @@
+.git
+.github
+.letta
+node_modules
+build
+.env
+config.json
+*.log
+test
