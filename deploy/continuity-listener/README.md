@@ -99,7 +99,10 @@ against the installed Letta version before relying on it.
 - State and credential files are written atomically with mode `0600`.
 - The reply guard accepts only the gateway-generated notification wrapper at
   the beginning of a content part and verifies its account/chat against the
-  selected agent's mode-0600 route registry before rewriting a tool call.
+  selected agent's mode-0600 route registry before rewriting a tool call. It
+  resolves the newest genuine user turn from scoped conversation history when
+  the tool executes rather than trusting process-local state from the previous
+  channel turn.
   Channel message text is XML-escaped by Letta and cannot mint a second trusted
   notification tag.
 - The bootstrap logs no token or API-key values.
