@@ -119,8 +119,11 @@ uses a different secret and remains on Railway's private network.
 - Account and route files are atomic, root-owned, and mode `0600`; malformed,
   conflicting, symlinked, or unsafe state aborts startup rather than being
   silently replaced.
-- The reply guard validates the gateway notification against the selected
-  agent's persisted route before rewriting `MessageChannel` arguments.
+- The reply guard resolves the newest genuine user turn from scoped
+  conversation history at tool-execution time, validates its gateway
+  notification against the selected agent's persisted route, and only then
+  rewrites `MessageChannel` arguments. It does not retain a process-local
+  previous route across rapid platform or Discord-channel switches.
 - Discord queueing is currently best-effort and in memory. A restart can lose
   unacknowledged events; a crash after Letta accepts an event but before bridge
   acknowledgement can redeliver it once.

@@ -139,7 +139,9 @@ user deploys. Do not market this as zero-configuration.
   conversation ID. This is what creates cross-channel continuity.
 - The reply-route guard is mandatory when multiple channels share one
   conversation. It prevents a stale `MessageChannel` schema from sending a
-  reply back to the preceding platform.
+  reply back to the preceding platform. The guard must resolve the active
+  user turn from scoped conversation history at tool-execution time; ingress
+  and client-tool hooks may not share safe process-local route state.
 - Letta's public documentation currently describes custom CLI channels as a
   local-backend surface. This cloud-agent listener is an advanced,
   self-managed community pattern and must remain version-pinned and regression

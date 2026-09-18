@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 
-const ROUTE_MAX_AGE_MS = 15 * 60 * 1000;
 const ALLOWED_CHANNELS = new Set(["telegram", "continuity-discord"]);
 
 function textPartsFromContent(content) {
@@ -78,8 +77,15 @@ export function extractSingleChannelRoute(input, options = {}) {
   return approvedRoute(route, options.agentId, options.conversationId, home) ? route : null;
 }
 
-function containsUserMessage(input) {
-  return (input ?? []).some(item => item?.type !== "approval" && item?.role === "user");
+export function extractLatestUserChannelRoute(history, options = {}) {
+  for (let index = (history ?? []).length - 1; index >= 0; index -= 1) {
+    const item = history[index];
+    if (item?.type === "approval" || item?.role !== "user") continue;
+    // The newest genuine user message defines the active turn. Never skip
+    // backwards over an ordinary message and inherit an older channel route.
+    return extractSingleChannelRoute([item], options);
+  }
+  return null;
 }
 
 function isMessageChannelTool(toolName) {
@@ -109,25 +115,14 @@ export default function activate(letta) {
     return;
   }
 
-  const activeRoutes = new Map();
-  const keyFor = (candidateAgentId, candidateConversationId) =>
-    `${candidateAgentId ?? ""}:${candidateConversationId ?? ""}`;
-
   const disposeTurn = letta.events.on("turn_start", event => {
     if (event.agentId !== agentId || event.conversationId !== conversationId) return;
-    const key = keyFor(event.agentId, event.conversationId);
     const route = extractSingleChannelRoute(event.input, {
       agentId,
       conversationId,
       home: process.env.HOME ?? "/root",
     });
-    if (!route) {
-      // Tool-result and approval continuations belong to the routed turn in
-      // progress. A genuinely new non-channel user turn clears stale state.
-      if (containsUserMessage(event.input)) activeRoutes.delete(key);
-      return;
-    }
-    activeRoutes.set(key, { ...route, capturedAt: Date.now() });
+    if (!route) return;
     return {
       input: [
         { type: "message", role: "system", content: routeReminder(route) },
@@ -136,13 +131,31 @@ export default function activate(letta) {
     };
   });
 
-  const disposeTool = letta.events.on("tool_start", event => {
+  const disposeTool = letta.events.on("tool_start", async (event, ctx) => {
     if (event.agentId !== agentId || event.conversationId !== conversationId) return;
     if (!isMessageChannelTool(event.toolName)) return;
-    const key = keyFor(event.agentId, event.conversationId);
-    const route = activeRoutes.get(key);
-    if (!route || Date.now() - route.capturedAt > ROUTE_MAX_AGE_MS) return;
     if (!event.args || typeof event.args !== "object") return;
+
+    // Channel ingress and client-side tool execution may run in separate mod
+    // contexts. Process-local route state can therefore remain pinned to the
+    // preceding channel during a rapid switch. Resolve the active turn from
+    // scoped conversation history at the moment the tool executes instead.
+    let history;
+    try {
+      history = await ctx?.conversation?.getHistory({ limit: 100 });
+    } catch {
+      letta.diagnostics?.report?.({
+        severity: "error",
+        message: "channel-reply-route-guard could not resolve current conversation history",
+      });
+      return;
+    }
+    const route = extractLatestUserChannelRoute(history, {
+      agentId,
+      conversationId,
+      home: process.env.HOME ?? "/root",
+    });
+    if (!route) return;
 
     const rewritten = {
       ...event.args,
@@ -158,6 +171,5 @@ export default function activate(letta) {
   return () => {
     disposeTool();
     disposeTurn();
-    activeRoutes.clear();
   };
 }
