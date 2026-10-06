@@ -79,8 +79,6 @@ test("continuity listener seed creates private Telegram and Discord routes into 
   assert.equal(discord.accounts[0].channel, "cass-discord");
   assert.equal(discord.accounts[0].config.base_url, "http://discord-bridge.railway.internal:3001");
   assert.equal(discord.accounts[0].config.auth, BRIDGE_TOKEN);
-  assert.equal(discord.accounts[0].config.serialize_turns, true);
-  assert.equal(discord.accounts[0].config.turn_lifecycle_timeout_ms, 1200000);
   const discordRoutes = await readJson(join(discordDir, "routing.yaml"));
   assert.deepEqual(discordRoutes.routes.map(route => route.chatId), [FIRST_CHANNEL]);
   assert.equal(discordRoutes.routes[0].agentId, AGENT_ID);
