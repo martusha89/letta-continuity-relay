@@ -3,9 +3,14 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { loadConfig } from "../build/config.js";
 import { gateInbound, stripBotMention, toInboundMessage } from "../build/bridge/inbound.js";
-import { toMessageView } from "../build/bridge/discord-adapter.js";
+import { createInboundPipeline, toMessageView } from "../build/bridge/discord-adapter.js";
 import { BoundedIdempotencySet, BridgeEventQueue } from "../build/bridge/queue.js";
 import { createBridgeRouter, parseSendAction } from "../build/bridge/router.js";
+import { createBridgeSendHandlers } from "../build/bridge/runtime.js";
+import { parseProactiveDestinations, normalizeDestinationAlias } from "../build/config.js";
+import { resolveProactiveTarget, verifyProactiveDestinations, composeMentionTokens } from "../build/discord/destinations.js";
+import { buildMessagePayload } from "../build/discord/messages.js";
+import { assertMentionRolesAllowed, assertMentionUsersAllowed } from "../build/discord/policy.js";
 import { createHttpApp } from "../build/http-app.js";
 import { publicBridgeError } from "../build/public-error.js";
 
@@ -16,6 +21,8 @@ const USER_ID = "333333333333333333";
 const OTHER_GUILD = "444444444444444444";
 const OTHER_CHANNEL = "555555555555555555";
 const BOYS_ROLE_ID = "666666666666666666";
+const COMPANION_BOT_ID = "777777777777777777";
+const REQUEST_ID = "11111111-1111-4111-8111-111111111111";
 
 const POLICY = {
   allowedGuildIds: [GUILD_ID],
@@ -27,7 +34,7 @@ const POLICY = {
   remoteMode: true,
 };
 
-const BRIDGE = { dmUserIds: [USER_ID], channelIds: [], roleIds: [], allowEveryone: false, queueLimit: 8, pollTimeoutMs: 50, jsonLimitBytes: 4096, rateLimitPerMinute: 1000, enabled: true, bearerToken: "b".repeat(32) };
+const BRIDGE = { dmUserIds: [USER_ID], channelIds: [], roleIds: [], botCooldownMs: 30000, allowEveryone: false, queueLimit: 8, pollTimeoutMs: 50, jsonLimitBytes: 4096, rateLimitPerMinute: 1000, enabled: true, bearerToken: "b".repeat(32) };
 
 function view(overrides = {}) {
   return {
@@ -70,6 +77,7 @@ test("bridge is disabled by default and needs no token", () => {
   assert.deepEqual(cfg.bridge.dmUserIds, []);
   assert.deepEqual(cfg.bridge.channelIds, []);
   assert.deepEqual(cfg.bridge.roleIds, []);
+  assert.equal(cfg.bridge.botCooldownMs, 30000);
   assert.equal(cfg.bridge.allowEveryone, false);
   assert.equal(cfg.bridge.queueLimit, 256);
   assert.equal(cfg.bridge.pollTimeoutMs, 20000);
@@ -105,7 +113,7 @@ test("enabling the bridge requires a dedicated 32+ char token distinct from the 
   }), /MCP_TRANSPORT=http/);
 });
 
-test("bridge inbound channel, DM, and role allowlists are parsed and deduplicated", () => {
+test("bridge inbound channel, DM, role, and bot cooldown policies are parsed and deduplicated", () => {
   const cfg = loadConfig({
     DISCORD_TOKEN: "not-a-real-token",
     MCP_TRANSPORT: "http",
@@ -117,11 +125,13 @@ test("bridge inbound channel, DM, and role allowlists are parsed and deduplicate
     DISCORD_BRIDGE_DM_USER_IDS: `${USER_ID}, ${USER_ID}`,
     DISCORD_BRIDGE_CHANNEL_IDS: `${CHANNEL_ID}, ${CHANNEL_ID}`,
     DISCORD_BRIDGE_ROLE_IDS: `${BOYS_ROLE_ID}, ${BOYS_ROLE_ID}`,
+    DISCORD_BRIDGE_BOT_COOLDOWN_MS: "45000",
     DISCORD_BRIDGE_ALLOW_EVERYONE: "true",
   });
   assert.deepEqual(cfg.bridge.dmUserIds, [USER_ID]);
   assert.deepEqual(cfg.bridge.channelIds, [CHANNEL_ID]);
   assert.deepEqual(cfg.bridge.roleIds, [BOYS_ROLE_ID]);
+  assert.equal(cfg.bridge.botCooldownMs, 45000);
   assert.equal(cfg.bridge.allowEveryone, true);
   assert.throws(() => loadConfig({
     DISCORD_TOKEN: "not-a-real-token",
@@ -172,6 +182,7 @@ test("toInboundMessage produces the full InboundChannelMessage-shaped payload", 
   assert.equal(message.parentChannelId, CHANNEL_ID);
   assert.equal(message.authorId, USER_ID);
   assert.equal(message.authorName, "alice");
+  assert.equal(message.authorIsBot, false);
   assert.equal(message.messageId, "100000000000000001");
   assert.equal(message.timestamp, "2026-01-01T00:00:00.000Z");
   assert.equal(message.text, "hello");
@@ -293,11 +304,134 @@ test("gateInbound does not treat a reply to another bot as addressed to the rela
   assert.equal(result.reason, "not_addressed_to_bot");
 });
 
-test("gateInbound ignores bot, webhook, system, and missing authors", () => {
-  assert.equal(gateInbound(view({ author: { id: "1", username: "b", bot: true } }), POLICY, BRIDGE, BOT_ID).reason, "bot_author");
+test("gateInbound ignores self-bot, webhook, system, and missing authors", () => {
+  assert.equal(gateInbound(view({ author: { id: BOT_ID, username: "self", bot: true } }), POLICY, BRIDGE, BOT_ID).reason, "bot_author");
   assert.equal(gateInbound(view({ webhookId: "123" }), POLICY, BRIDGE, BOT_ID).reason, "webhook_author");
   assert.equal(gateInbound(view({ system: true }), POLICY, BRIDGE, BOT_ID).reason, "system_author");
   assert.equal(gateInbound(view({ author: null }), POLICY, BRIDGE, BOT_ID).reason, "system_author");
+});
+
+test("bots in permitted channels require a direct relay-bot mention", () => {
+  const trusted = { id: COMPANION_BOT_ID, username: "companion", bot: true, system: false };
+  const directMention = gateInbound(view({
+    author: trusted,
+    content: `<@${BOT_ID}> hello back`,
+    mentionsUserIds: [BOT_ID],
+    referencedMessageId: "123",
+    referencedAuthorId: BOT_ID,
+  }), POLICY, BRIDGE, BOT_ID);
+  assert.equal(directMention.verdict, "deliver");
+  assert.equal(directMention.message.text, "hello back");
+  assert.equal(directMention.message.authorIsBot, true);
+
+  assert.equal(gateInbound(view({
+    author: trusted,
+    content: "reply without a direct mention",
+    mentionsUserIds: [],
+    referencedMessageId: "123",
+    referencedAuthorId: BOT_ID,
+  }), POLICY, BRIDGE, BOT_ID).reason, "bot_direct_mention_required");
+  assert.equal(gateInbound(view({
+    author: trusted,
+    content: `<@&${BOYS_ROLE_ID}> role ping`,
+    mentionsUserIds: [],
+    mentionsRoleIds: [BOYS_ROLE_ID],
+  }), POLICY, { ...BRIDGE, roleIds: [BOYS_ROLE_ID] }, BOT_ID).reason, "bot_direct_mention_required");
+  assert.equal(gateInbound(view({
+    author: trusted,
+    content: "@everyone announcement",
+    mentionsUserIds: [],
+    mentionsEveryone: true,
+  }), POLICY, { ...BRIDGE, allowEveryone: true }, BOT_ID).reason, "bot_direct_mention_required");
+  assert.equal(gateInbound(view({
+    author: trusted,
+    content: "ambient bot chatter",
+    mentionsUserIds: [],
+  }), POLICY, BRIDGE, BOT_ID).reason, "bot_direct_mention_required");
+  assert.equal(gateInbound(view({
+    author: { id: "888888888888888888", username: "another companion", bot: true, system: false },
+  }), POLICY, BRIDGE, BOT_ID).verdict, "deliver");
+  assert.equal(gateInbound(view({
+    author: { id: BOT_ID, username: "self", bot: true, system: false },
+  }), POLICY, BRIDGE, BOT_ID).reason, "bot_author");
+});
+
+test("bots inherit permitted thread-parent access but cannot cross channel policy", () => {
+  const thread = "666666666666666666";
+  const trusted = { id: COMPANION_BOT_ID, username: "companion", bot: true, system: false };
+  const inherited = gateInbound(view({
+    author: trusted,
+    channelId: thread,
+    threadId: thread,
+    parentChannelId: CHANNEL_ID,
+  }), POLICY, BRIDGE, BOT_ID);
+  assert.equal(inherited.verdict, "deliver");
+  assert.equal(gateInbound(view({
+    author: trusted,
+    channelId: OTHER_CHANNEL,
+    threadId: null,
+    parentChannelId: null,
+  }), POLICY, BRIDGE, BOT_ID).reason, "channel_not_allowed");
+});
+
+test("companion bots never bypass guild, DM, webhook, or system boundaries", () => {
+  const trusted = { id: COMPANION_BOT_ID, username: "companion", bot: true, system: false };
+  assert.equal(gateInbound(view({ author: trusted, guildId: OTHER_GUILD }), POLICY, BRIDGE, BOT_ID).reason, "guild_not_allowed");
+  assert.equal(gateInbound(view({
+    author: trusted,
+    isDM: true,
+    dmUserId: COMPANION_BOT_ID,
+    guildId: null,
+    guildName: null,
+    channelId: "777777777777777777",
+  }), POLICY, BRIDGE, BOT_ID).reason, "bot_author");
+  assert.equal(gateInbound(view({ author: trusted, webhookId: "777777777777777777" }), POLICY, BRIDGE, BOT_ID).reason, "webhook_author");
+  assert.equal(gateInbound(view({ author: trusted, system: true }), POLICY, BRIDGE, BOT_ID).reason, "system_author");
+});
+
+test("inbound pipeline applies a bounded per-bot/per-channel cooldown after acceptance", async () => {
+  let messageHandler;
+  const logs = [];
+  const secondBot = "888888888888888888";
+  const bridge = {
+    ...BRIDGE,
+    botCooldownMs: 60_000,
+  };
+  const pipeline = createInboundPipeline({
+    policy: { ...POLICY, allowedChannelIds: [] },
+    bridge,
+    botUserId: () => BOT_ID,
+    log: line => logs.push(line),
+  });
+  pipeline.attach({ on(eventName, handler) { assert.equal(eventName, "messageCreate"); messageHandler = handler; } });
+  const discordMessage = (id, channelId = CHANNEL_ID, authorId = COMPANION_BOT_ID) => ({
+    id,
+    author: { id: authorId, username: "companion", bot: true, system: false },
+    webhookId: null,
+    system: false,
+    content: `<@${BOT_ID}> hello`,
+    createdAt: new Date("2026-01-01T00:00:00Z"),
+    guild: { name: "Test Guild" },
+    guildId: GUILD_ID,
+    channelId,
+    channel: { name: "general", isThread: () => false },
+    mentions: {
+      users: new Map([[BOT_ID, { id: BOT_ID }]]),
+      roles: new Map(),
+      everyone: false,
+      repliedUser: null,
+    },
+    reference: null,
+    attachments: [],
+  });
+  messageHandler(discordMessage("100000000000000010"));
+  messageHandler(discordMessage("100000000000000011"));
+  messageHandler(discordMessage("100000000000000012", OTHER_CHANNEL));
+  messageHandler(discordMessage("100000000000000013", CHANNEL_ID, secondBot));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(pipeline.queue.size, 3);
+  assert.equal(pipeline.queue.since(0)[0].message.authorIsBot, true);
+  assert.ok(logs.includes("[bridge] inbound ignored: bot_cooldown"));
 });
 
 test("gateInbound enforces guild and channel policy", () => {
@@ -372,6 +506,24 @@ test("queue assigns monotonic sequence IDs and ack removes in order", () => {
   assert.equal(queue.lastSeq, 2); // sequence never rewinds
 });
 
+test("queue can acknowledge one later event while retaining an older stalled event", () => {
+  const queue = new BridgeEventQueue(4);
+  queue.enqueue({ messageId: "1" });
+  queue.enqueue({ messageId: "2" });
+  assert.equal(queue.ackOne(2), 1);
+  assert.deepEqual(queue.since(0).map(event => event.seq), [1]);
+  assert.equal(queue.ackOne(2), 0);
+  assert.equal(queue.ackOne(-1), 0);
+});
+
+test("exact acknowledgement cannot remove a reused sequence with a different message ID", () => {
+  const queue = new BridgeEventQueue(4);
+  queue.enqueue({ messageId: "current-generation" });
+  assert.equal(queue.ackOne(1, "previous-generation"), 0);
+  assert.deepEqual(queue.since(0).map(event => event.message.messageId), ["current-generation"]);
+  assert.equal(queue.ackOne(1, "current-generation"), 1);
+});
+
 test("ack of a future sequence removes everything currently queued", () => {
   const queue = new BridgeEventQueue(4);
   queue.enqueue({ messageId: "1" });
@@ -412,11 +564,13 @@ test("long-poll wakes when an event arrives while waiting", async () => {
 
 // ------------------------------------------------------- send action validation
 
-test("parseSendAction validates send, react, and typing shapes and rejects everything else", () => {
+test("parseSendAction validates channel, DM, reaction, and typing shapes", () => {
   assert.deepEqual(parseSendAction({ kind: "send", channel: CHANNEL_ID, text: "hi" }),
     { kind: "send", channel: CHANNEL_ID, text: "hi" });
   assert.deepEqual(parseSendAction({ kind: "send", channel: CHANNEL_ID, text: "hi", replyToMessageId: "100000000000000001" }),
     { kind: "send", channel: CHANNEL_ID, text: "hi", replyToMessageId: "100000000000000001" });
+  assert.deepEqual(parseSendAction({ kind: "send_dm", userId: USER_ID, text: "hi", replyToMessageId: "100000000000000001" }),
+    { kind: "send_dm", userId: USER_ID, text: "hi", replyToMessageId: "100000000000000001" });
   assert.deepEqual(parseSendAction({ kind: "react", channel: CHANNEL_ID, messageId: "100000000000000001", emoji: "👍" }),
     { kind: "react", channel: CHANNEL_ID, messageId: "100000000000000001", emoji: "👍" });
   assert.deepEqual(parseSendAction({ kind: "typing", channel: CHANNEL_ID }),
@@ -426,12 +580,416 @@ test("parseSendAction validates send, react, and typing shapes and rejects every
   assert.equal(parseSendAction({ kind: "send", channel: CHANNEL_ID, text: "" }), null);
   assert.equal(parseSendAction({ kind: "send", channel: CHANNEL_ID }), null);
   assert.equal(parseSendAction({ kind: "send", channel: CHANNEL_ID, text: "hi", replyToMessageId: "junk" }), null);
+  assert.equal(parseSendAction({ kind: "send_dm", userId: "junk", text: "hi" }), null);
+  assert.equal(parseSendAction({ kind: "send_dm", userId: USER_ID, text: "" }), null);
   assert.equal(parseSendAction({ kind: "react", channel: CHANNEL_ID, messageId: "100000000000000001", emoji: "" }), null);
   assert.equal(parseSendAction({ kind: "react", channel: CHANNEL_ID, messageId: "x".repeat(65) }), null);
   assert.equal(parseSendAction({ kind: "typing", channel: "not-a-snowflake" }), null);
   assert.equal(parseSendAction({ kind: "upload", channel: CHANNEL_ID }), null);
   assert.equal(parseSendAction({}), null);
   assert.equal(parseSendAction("nope"), null);
+});
+
+test("parseSendAction accepts proactive_send aliases and strictly rejects raw-route keys", () => {
+  // Valid shapes.
+  assert.deepEqual(parseSendAction({ kind: "proactive_send", requestId: REQUEST_ID, destination: "aidhd.porch", text: "hello" }),
+    { kind: "proactive_send", requestId: REQUEST_ID, destination: "aidhd.porch", text: "hello" });
+  assert.deepEqual(parseSendAction({ kind: "proactive_send", requestId: REQUEST_ID, destination: "  AIDHD.PORCH ", text: "hello", mentions: ["Marta", "boys"] }),
+    { kind: "proactive_send", requestId: REQUEST_ID, destination: "aidhd.porch", text: "hello", mentions: ["marta", "boys"] });
+
+  // Missing/empty fields.
+  assert.equal(parseSendAction({ kind: "proactive_send", text: "hi" }), null);
+  assert.equal(parseSendAction({ kind: "proactive_send", requestId: "not-a-uuid", destination: "aidhd.porch", text: "hi" }), null);
+  assert.equal(parseSendAction({ kind: "proactive_send", requestId: REQUEST_ID, destination: "", text: "hi" }), null);
+  assert.equal(parseSendAction({ kind: "proactive_send", requestId: REQUEST_ID, destination: "has space", text: "hi" }), null);
+  assert.equal(parseSendAction({ kind: "proactive_send", requestId: REQUEST_ID, destination: CHANNEL_ID, text: "hi" }), null);
+  assert.equal(parseSendAction({ kind: "proactive_send", requestId: REQUEST_ID, destination: "aidhd.porch" }), null);
+  assert.equal(parseSendAction({ kind: "proactive_send", requestId: REQUEST_ID, destination: "aidhd.porch", text: "" }), null);
+
+  // Raw-route keys are strictly rejected alongside proactive_send.
+  for (const rawKey of ["channel", "channelId", "userId", "guildId", "roleId", "replyToMessageId", "allowedMentions", "mentionUserIds", "mentionRoleIds"]) {
+    assert.equal(parseSendAction({ kind: "proactive_send", requestId: REQUEST_ID, destination: "aidhd.porch", text: "hi", [rawKey]: CHANNEL_ID }), null,
+      `raw key ${rawKey} must be rejected`);
+  }
+  assert.equal(parseSendAction({ kind: "proactive_send", requestId: REQUEST_ID, destination: "aidhd.porch", text: "hi", unrelated: true }), null);
+
+  // Mention aliases must be non-empty strings, non-snowflake, and duplicate-free.
+  assert.equal(parseSendAction({ kind: "proactive_send", requestId: REQUEST_ID, destination: "d", text: "hi", mentions: "boys" }), null);
+  assert.equal(parseSendAction({ kind: "proactive_send", requestId: REQUEST_ID, destination: "d", text: "hi", mentions: [""] }), null);
+  assert.equal(parseSendAction({ kind: "proactive_send", requestId: REQUEST_ID, destination: "d", text: "hi", mentions: [CHANNEL_ID] }), null);
+  assert.equal(parseSendAction({ kind: "proactive_send", requestId: REQUEST_ID, destination: "d", text: "hi", mentions: ["has space"] }), null);
+  assert.equal(parseSendAction({ kind: "proactive_send", requestId: REQUEST_ID, destination: "d", text: "hi", mentions: ["boys", "BOYS"] }), null);
+  assert.equal(parseSendAction({ kind: "proactive_send", requestId: REQUEST_ID, destination: "d", text: "hi", mentions: [42] }), null);
+});
+
+// ------------------------------------------------- proactive destination registry
+
+const REGISTRY_JSON = JSON.stringify({
+  "aidhd.porch": {
+    guildId: GUILD_ID,
+    channelId: CHANNEL_ID,
+    mentions: {
+      marta: { kind: "user", id: USER_ID },
+      boys: { kind: "role", id: BOYS_ROLE_ID },
+    },
+  },
+});
+
+function registryFromEnv(value) {
+  return parseProactiveDestinations("DISCORD_BRIDGE_PROACTIVE_DESTINATIONS_JSON", value);
+}
+
+test("proactive destination registry parses strict JSON and normalizes aliases", () => {
+  const registry = registryFromEnv(REGISTRY_JSON);
+  assert.equal(registry.size, 1);
+  const porch = registry.get("aidhd.porch");
+  assert.ok(porch);
+  assert.equal(porch.guildId, GUILD_ID);
+  assert.equal(porch.channelId, CHANNEL_ID);
+  assert.equal(porch.mentions.get("marta").kind, "user");
+  assert.equal(porch.mentions.get("marta").id, USER_ID);
+  assert.equal(porch.mentions.get("boys").kind, "role");
+  assert.equal(porch.mentions.get("boys").id, BOYS_ROLE_ID);
+
+  // Mixed-case keys normalize to the same lowercase alias.
+  const normalized = registryFromEnv(JSON.stringify({ "AIDHD.PORCH": { guildId: GUILD_ID, channelId: CHANNEL_ID } }));
+  assert.ok(normalized.get("aidhd.porch"));
+
+  // Omitted and empty values are valid: no proactive destinations.
+  assert.equal(registryFromEnv(undefined).size, 0);
+  assert.equal(registryFromEnv("").size, 0);
+  assert.equal(registryFromEnv("   ").size, 0);
+
+  // Alias normalization helper: restrictive pattern, snowflake-shaped rejected.
+  assert.equal(normalizeDestinationAlias("  Porch "), "porch");
+  assert.equal(normalizeDestinationAlias("aidhd.porch"), "aidhd.porch");
+  assert.equal(normalizeDestinationAlias("aidhd-porch_2"), "aidhd-porch_2");
+  assert.equal(normalizeDestinationAlias(""), null);
+  assert.equal(normalizeDestinationAlias("222222222222222222"), null, "snowflake-shaped alias rejected");
+  assert.equal(normalizeDestinationAlias("has space"), null);
+  assert.equal(normalizeDestinationAlias("UPPER"), "upper");
+});
+
+test("proactive destination registry rejects malformed and duplicate configuration", () => {
+  // Not strict JSON.
+  assert.throws(() => registryFromEnv("{not json"), /strict JSON/);
+  assert.throws(() => registryFromEnv("[1,2]"), /JSON object/);
+  assert.throws(() => registryFromEnv("42"), /JSON object/);
+  // Duplicate destination aliases after normalization.
+  assert.throws(() => registryFromEnv(JSON.stringify({
+    porch: { guildId: GUILD_ID, channelId: CHANNEL_ID },
+    PORCH: { guildId: GUILD_ID, channelId: CHANNEL_ID },
+  })), /duplicate destination alias/);
+  // Invalid destination alias.
+  assert.throws(() => registryFromEnv(JSON.stringify({
+    "222222222222222222": { guildId: GUILD_ID, channelId: CHANNEL_ID },
+  })), /invalid destination alias/);
+  assert.throws(() => registryFromEnv(JSON.stringify({
+    "has space": { guildId: GUILD_ID, channelId: CHANNEL_ID },
+  })), /invalid destination alias/);
+  // Bad destination shapes.
+  assert.throws(() => registryFromEnv(JSON.stringify({ porch: {} })), /invalid/);
+  assert.throws(() => registryFromEnv(JSON.stringify({ porch: { guildId: "nope", channelId: CHANNEL_ID } })), /invalid/);
+  assert.throws(() => registryFromEnv(JSON.stringify({ porch: { guildId: GUILD_ID, channelId: CHANNEL_ID, extra: 1 } })), /invalid/);
+  // Duplicate mention aliases within one destination.
+  assert.throws(() => registryFromEnv(JSON.stringify({
+    porch: {
+      guildId: GUILD_ID, channelId: CHANNEL_ID,
+      mentions: { boys: { kind: "role", id: BOYS_ROLE_ID }, BOYS: { kind: "role", id: BOYS_ROLE_ID } },
+    },
+  })), /duplicate mention alias/);
+  // Invalid mention alias and bad mention shape.
+  assert.throws(() => registryFromEnv(JSON.stringify({
+    porch: { guildId: GUILD_ID, channelId: CHANNEL_ID, mentions: { "222222222222222222": { kind: "user", id: USER_ID } } },
+  })), /invalid mention alias/);
+  assert.throws(() => registryFromEnv(JSON.stringify({
+    porch: { guildId: GUILD_ID, channelId: CHANNEL_ID, mentions: { marta: { kind: "everyone", id: USER_ID } } },
+  })), /invalid/);
+  assert.throws(() => registryFromEnv(JSON.stringify({
+    porch: { guildId: GUILD_ID, channelId: CHANNEL_ID, mentions: { marta: { kind: "user", id: "not-a-snowflake" } } },
+  })), /invalid/);
+});
+
+test("resolveProactiveTarget resolves aliases server-side and enforces mention policy", () => {
+  const registry = registryFromEnv(REGISTRY_JSON);
+  const allowAll = { allowedMentionUserIds: [USER_ID], allowedMentionRoleIds: [BOYS_ROLE_ID] };
+
+  // Successful alias resolution with both mention kinds.
+  const resolved = resolveProactiveTarget(registry, allowAll, "aidhd.porch", ["marta", "boys"]);
+  assert.deepEqual(resolved, {
+    guildId: GUILD_ID, channelId: CHANNEL_ID,
+    mentionUserIds: [USER_ID], mentionRoleIds: [BOYS_ROLE_ID],
+  });
+
+  // No mentions is fine.
+  assert.deepEqual(resolveProactiveTarget(registry, allowAll, "aidhd.porch", []),
+    { guildId: GUILD_ID, channelId: CHANNEL_ID, mentionUserIds: [], mentionRoleIds: [] });
+
+  // Unknown destination fails closed.
+  assert.throws(() => resolveProactiveTarget(registry, allowAll, "missing.place", []),
+    /Unknown proactive destination/);
+  // Unknown mention alias for a known destination fails closed.
+  assert.throws(() => resolveProactiveTarget(registry, allowAll, "aidhd.porch", ["nobody"]),
+    /Unknown proactive mention/);
+  // Mention IDs must pass the global allowlists: role not allowlisted.
+  assert.throws(() => resolveProactiveTarget(registry, { allowedMentionUserIds: [USER_ID], allowedMentionRoleIds: [] }, "aidhd.porch", ["boys"]),
+    /Mentioned role is not allowed/);
+  // User not allowlisted.
+  assert.throws(() => resolveProactiveTarget(registry, { allowedMentionUserIds: [], allowedMentionRoleIds: [BOYS_ROLE_ID] }, "aidhd.porch", ["marta"]),
+    /Mention recipient is not allowed/);
+  // Duplicate mention aliases deduplicate to one ID each.
+  const deduped = resolveProactiveTarget(registry, allowAll, "aidhd.porch", ["marta", "marta"]);
+  assert.deepEqual(deduped.mentionUserIds, [USER_ID]);
+  assert.deepEqual(deduped.mentionRoleIds, []);
+});
+
+test("verifyProactiveDestinations fails startup on unknown or mismatched destinations", async () => {
+  const registry = registryFromEnv(REGISTRY_JSON);
+  const policy = {
+    ...POLICY,
+    allowedMentionUserIds: [USER_ID],
+    allowedMentionRoleIds: [BOYS_ROLE_ID],
+  };
+
+  // Happy path: guild, channel in that guild, bot permission, and role/member resolvable.
+  const okVerifier = {
+    fetchGuild: async id => ({ id }),
+    fetchSendableChannel: async id => ({ id, guildId: GUILD_ID, parentId: null }),
+    fetchRole: async (guildId, roleId) => ({ id: roleId, managed: false, mentionable: true }),
+    fetchMember: async (guildId, userId) => ({ id: userId }),
+    canSendToChannel: async () => true,
+  };
+  await verifyProactiveDestinations(registry, okVerifier, policy);
+
+  // Unknown guild.
+  await assert.rejects(() => verifyProactiveDestinations(registry, {
+    ...okVerifier, fetchGuild: async () => null,
+  }, policy), /unknown guild/);
+  // Unknown or non-sendable channel.
+  await assert.rejects(() => verifyProactiveDestinations(registry, {
+    ...okVerifier, fetchSendableChannel: async () => null,
+  }, policy), /unknown or non-sendable channel/);
+  // Channel in a different guild.
+  await assert.rejects(() => verifyProactiveDestinations(registry, {
+    ...okVerifier, fetchSendableChannel: async id => ({ id, guildId: OTHER_GUILD, parentId: null }),
+  }, policy), /not in its configured guild/);
+  // Bot lacks permission to view/send.
+  await assert.rejects(() => verifyProactiveDestinations(registry, {
+    ...okVerifier, canSendToChannel: async () => false,
+  }, policy), /not viewable and sendable/);
+  // Unknown role mention.
+  await assert.rejects(() => verifyProactiveDestinations(registry, {
+    ...okVerifier, fetchRole: async () => null,
+  }, policy), /unknown, managed, or unmentionable role/);
+  // Managed roles cannot be proactively pinged.
+  await assert.rejects(() => verifyProactiveDestinations(registry, {
+    ...okVerifier, fetchRole: async (_guildId, roleId) => ({ id: roleId, managed: true, mentionable: true }),
+  }, policy), /unknown, managed, or unmentionable role/);
+  await assert.rejects(() => verifyProactiveDestinations(registry, {
+    ...okVerifier, fetchRole: async (_guildId, roleId) => ({ id: roleId, managed: false, mentionable: false }),
+  }, policy), /unknown, managed, or unmentionable role/);
+  // Unknown guild member mention.
+  await assert.rejects(() => verifyProactiveDestinations(registry, {
+    ...okVerifier, fetchMember: async () => null,
+  }, policy), /unknown user/);
+  // Destination and mention IDs must remain inside global policy.
+  await assert.rejects(() => verifyProactiveDestinations(registry, okVerifier, {
+    ...policy,
+    allowedChannelIds: [OTHER_CHANNEL],
+  }), /not allowed by policy/);
+  await assert.rejects(() => verifyProactiveDestinations(registry, okVerifier, {
+    ...policy,
+    allowedMentionRoleIds: [],
+  }), /Mentioned role is not allowed/);
+});
+
+test("composeMentionTokens builds role and user tokens server-side", () => {
+  assert.deepEqual(composeMentionTokens([USER_ID], [BOYS_ROLE_ID]),
+    [`<@&${BOYS_ROLE_ID}>`, `<@${USER_ID}>`]);
+  assert.deepEqual(composeMentionTokens([], []), []);
+});
+
+test("proactive runtime handler resolves aliases and sends through the safe path", async () => {
+  const registry = registryFromEnv(REGISTRY_JSON);
+  const calls = [];
+  const limits = { messageChars: 2000 };
+  const handlers = createBridgeSendHandlers(
+    {
+      defaults: {},
+      limits,
+      policy: { allowedMentionUserIds: [USER_ID], allowedMentionRoleIds: [BOYS_ROLE_ID] },
+      bridge: { proactiveDestinations: registry },
+    },
+    {
+      sendMessage: async options => {
+        calls.push(options);
+        return { id: "900000000000000009", channelId: options.channel, channelName: "porch" };
+      },
+      sendDirectMessage: async () => { throw new Error("not used"); },
+      reactToMessage: async () => { throw new Error("not used"); },
+      setTyping: async () => { throw new Error("not used"); },
+    },
+  );
+
+  const result = await handlers.proactiveSend({ kind: "proactive_send", requestId: REQUEST_ID, destination: "aidhd.porch", text: "standup time", mentions: ["marta", "boys"] });
+  assert.deepEqual(result, { messageId: "900000000000000009", channelId: CHANNEL_ID, destination: "aidhd.porch", requestId: REQUEST_ID });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].channel, CHANNEL_ID);
+  assert.equal(calls[0].content, `<@&${BOYS_ROLE_ID}> <@${USER_ID}> standup time`);
+  assert.deepEqual(calls[0].mentionUserIds, [USER_ID]);
+  assert.deepEqual(calls[0].mentionRoleIds, [BOYS_ROLE_ID]);
+  assert.equal("fallbackGuildId" in calls[0], false);
+
+  // Without mentions the text is sent untouched.
+  await handlers.proactiveSend({ kind: "proactive_send", requestId: "22222222-2222-4222-8222-222222222222", destination: "aidhd.porch", text: "plain" });
+  assert.equal(calls[1].content, "plain");
+  assert.deepEqual(calls[1].mentionUserIds, []);
+  assert.deepEqual(calls[1].mentionRoleIds, []);
+
+  // Unknown destination and unknown mention fail closed via PolicyError.
+  await assert.rejects(() => handlers.proactiveSend({ kind: "proactive_send", requestId: "33333333-3333-4333-8333-333333333333", destination: "missing.place", text: "x" }),
+    /Unknown proactive destination/);
+  await assert.rejects(() => handlers.proactiveSend({ kind: "proactive_send", requestId: "44444444-4444-4444-8444-444444444444", destination: "aidhd.porch", text: "x", mentions: ["nobody"] }),
+    /Unknown proactive mention/);
+  assert.equal(calls.length, 2, "failed sends must not reach Discord");
+
+  // A repeated request ID reuses the first receipt without sending twice.
+  const repeated = await handlers.proactiveSend({
+    kind: "proactive_send", requestId: REQUEST_ID, destination: "aidhd.porch", text: "standup time", mentions: ["marta", "boys"],
+  });
+  assert.deepEqual(repeated, result);
+  assert.equal(calls.length, 2, "idempotent retry must not send again");
+});
+
+test("proactive idempotency expires settled receipts but never evicts an in-flight send", async () => {
+  const registry = registryFromEnv(REGISTRY_JSON);
+  const originalNow = Date.now;
+  let now = 1_000_000;
+  Date.now = () => now;
+  try {
+    let completedCalls = 0;
+    const completedHandlers = createBridgeSendHandlers({
+      defaults: {},
+      limits: { messageChars: 2000 },
+      policy: { allowedMentionUserIds: [USER_ID], allowedMentionRoleIds: [BOYS_ROLE_ID] },
+      bridge: { proactiveDestinations: registry },
+    }, {
+      sendMessage: async options => {
+        completedCalls += 1;
+        return { id: "900000000000000009", channelId: options.channel, channelName: "porch" };
+      },
+      sendDirectMessage: async () => { throw new Error("not used"); },
+      reactToMessage: async () => { throw new Error("not used"); },
+      setTyping: async () => { throw new Error("not used"); },
+    });
+    const action = { kind: "proactive_send", requestId: REQUEST_ID, destination: "aidhd.porch", text: "hello" };
+    await completedHandlers.proactiveSend(action);
+    now += 9 * 60_000;
+    await completedHandlers.proactiveSend(action);
+    assert.equal(completedCalls, 1, "settled receipt must remain cached before TTL");
+    now += 2 * 60_000;
+    await completedHandlers.proactiveSend(action);
+    assert.equal(completedCalls, 2, "settled receipt must expire after TTL");
+
+    let resolveSend;
+    let inFlightCalls = 0;
+    const inFlightHandlers = createBridgeSendHandlers({
+      defaults: {},
+      limits: { messageChars: 2000 },
+      policy: { allowedMentionUserIds: [USER_ID], allowedMentionRoleIds: [BOYS_ROLE_ID] },
+      bridge: { proactiveDestinations: registry },
+    }, {
+      sendMessage: async options => {
+        inFlightCalls += 1;
+        return await new Promise(resolve => {
+          resolveSend = () => resolve({ id: "900000000000000009", channelId: options.channel, channelName: "porch" });
+        });
+      },
+      sendDirectMessage: async () => { throw new Error("not used"); },
+      reactToMessage: async () => { throw new Error("not used"); },
+      setTyping: async () => { throw new Error("not used"); },
+    });
+    const first = inFlightHandlers.proactiveSend(action);
+    await Promise.resolve();
+    now += 11 * 60_000;
+    const repeated = inFlightHandlers.proactiveSend(action);
+    await Promise.resolve();
+    assert.equal(inFlightCalls, 1, "in-flight send must survive TTL pruning");
+    resolveSend();
+    assert.deepEqual(await repeated, await first);
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("proactive idempotency fails closed instead of evicting 512 in-flight sends", async () => {
+  const registry = registryFromEnv(REGISTRY_JSON);
+  let resolveShared;
+  const shared = new Promise(resolve => { resolveShared = resolve; });
+  let calls = 0;
+  const handlers = createBridgeSendHandlers({
+    defaults: {},
+    limits: { messageChars: 2000 },
+    policy: { allowedMentionUserIds: [USER_ID], allowedMentionRoleIds: [BOYS_ROLE_ID] },
+    bridge: { proactiveDestinations: registry },
+  }, {
+    sendMessage: async options => {
+      calls += 1;
+      await shared;
+      return { id: "900000000000000009", channelId: options.channel, channelName: "porch" };
+    },
+    sendDirectMessage: async () => { throw new Error("not used"); },
+    reactToMessage: async () => { throw new Error("not used"); },
+    setTyping: async () => { throw new Error("not used"); },
+  });
+  const pending = Array.from({ length: 512 }, (_, index) => handlers.proactiveSend({
+    kind: "proactive_send",
+    requestId: `capacity-${index}`,
+    destination: "aidhd.porch",
+    text: `message ${index}`,
+  }));
+  await Promise.resolve();
+  await assert.rejects(() => handlers.proactiveSend({
+    kind: "proactive_send",
+    requestId: "capacity-overflow",
+    destination: "aidhd.porch",
+    text: "must not evict",
+  }), /capacity is temporarily exhausted/);
+  assert.equal(calls, 512);
+  resolveShared();
+  await Promise.all(pending);
+});
+
+test("exact-ID bridge actions are not constrained to the configured default guild", async () => {
+  const calls = [];
+  const limits = { messageChars: 2000 };
+  const handlers = createBridgeSendHandlers(
+    { defaults: { guildId: GUILD_ID }, limits },
+    {
+      sendMessage: async options => {
+        calls.push(["send", options]);
+        return { id: "900000000000000001", channelId: options.channel, channelName: "cross-guild" };
+      },
+      sendDirectMessage: async options => {
+        calls.push(["send_dm", options]);
+        return { id: "900000000000000002", channelId: "900000000000000003", recipient: "user" };
+      },
+      reactToMessage: async options => { calls.push(["react", options]); return { ok: true }; },
+      setTyping: async options => { calls.push(["typing", options]); return { ok: true }; },
+    },
+  );
+  await handlers.send({ kind: "send", channel: OTHER_CHANNEL, text: "cross-guild reply" });
+  await handlers.react({ kind: "react", channel: OTHER_CHANNEL, messageId: "900000000000000004", emoji: "👍" });
+  await handlers.typing({ kind: "typing", channel: OTHER_CHANNEL });
+
+  assert.deepEqual(calls, [
+    ["send", { channel: OTHER_CHANNEL, content: "cross-guild reply", replyToMessageId: undefined, limits }],
+    ["react", { channel: OTHER_CHANNEL, messageId: "900000000000000004", emoji: "👍" }],
+    ["typing", { channel: OTHER_CHANNEL }],
+  ]);
+  for (const [, options] of calls) {
+    assert.equal("fallbackGuildId" in options, false, "default guild must not constrain exact-ID bridge actions");
+  }
 });
 
 // ------------------------------------------------------------- HTTP endpoints
@@ -441,6 +999,21 @@ function makeApp(overrides = {}) {
   const calls = [];
   const sendHandlers = {
     send: async action => { calls.push(action); return { messageId: "900000000000000001", channelId: action.channel }; },
+    sendDm: async action => { calls.push(action); return { messageId: "900000000000000002", channelId: "900000000000000003" }; },
+    proactiveSend: async action => {
+      if (action.destination !== "aidhd.porch") {
+        const error = new Error("Unknown proactive destination");
+        error.name = "PolicyError";
+        throw error;
+      }
+      calls.push(action);
+      return {
+        messageId: "900000000000000010",
+        channelId: CHANNEL_ID,
+        destination: action.destination,
+        requestId: action.requestId,
+      };
+    },
     react: async action => { calls.push(action); },
     typing: async action => { calls.push(action); },
     ...(overrides.sendHandlers ?? {}),
@@ -539,23 +1112,23 @@ test("GET /bridge/events resets a stale listener cursor after service restart", 
 });
 
 test("GET /bridge/events long-polls until an event arrives or the timeout elapses", async () => {
-  await withServer({ bridge: { pollTimeoutMs: 120 } }, async (base, queue) => {
+  await withServer({ bridge: { pollTimeoutMs: 1000 } }, async (base, queue) => {
     const started = Date.now();
     const pending = fetch(`${base}/bridge/events?after=0&wait=1`, { headers: AUTH });
-    setTimeout(() => queue.enqueue({ messageId: "1" }), 30);
+    setTimeout(() => queue.enqueue({ messageId: "1" }), 50);
     const response = await pending;
     const body = await response.json();
     assert.equal(body.events.length, 1);
-    assert.ok(Date.now() - started < 110, "long-poll resolved early via timeout instead of wakeup");
+    assert.ok(Date.now() - started < 800, "event wakeup did not beat the long-poll timeout");
 
     const t0 = Date.now();
     const empty = await (await fetch(`${base}/bridge/events?after=1&wait=1`, { headers: AUTH })).json();
     assert.deepEqual(empty.events, []);
-    assert.ok(Date.now() - t0 >= 100, "timeout long-poll returned too early");
+    assert.ok(Date.now() - t0 >= 800, "empty long-poll returned substantially before its configured timeout");
   });
 });
 
-test("POST /bridge/ack acknowledges ordered sequences and rejects invalid bodies", async () => {
+test("POST /bridge/ack supports exact acknowledgements without dropping older events", async () => {
   await withServer({}, async (base, queue) => {
     queue.enqueue({ messageId: "1" });
     queue.enqueue({ messageId: "2" });
@@ -566,7 +1139,31 @@ test("POST /bridge/ack acknowledges ordered sequences and rejects invalid bodies
     assert.equal(ack.lastSeq, 2);
     assert.equal(queue.size, 1);
 
-    for (const bad of ["[]", "null", '{"seq":"1"}', '{"seq":-1}', '{"seq":1.5}', '{"seq":99}', "{}"]) {
+    queue.enqueue({ messageId: "3" });
+    const exact = await (await fetch(`${base}/bridge/ack`, {
+      method: "POST", headers: { ...AUTH, "Content-Type": "application/json" }, body: JSON.stringify({ seq: 3, messageId: "3", exact: true }),
+    })).json();
+    assert.equal(exact.exact, true);
+    assert.equal(exact.messageId, "3");
+    assert.equal(exact.removed, 1);
+    assert.deepEqual(queue.since(0).map(event => event.seq), [2]);
+
+    const alreadyRemoved = await fetch(`${base}/bridge/ack`, {
+      method: "POST", headers: { ...AUTH, "Content-Type": "application/json" }, body: JSON.stringify({ seq: 3, messageId: "3", exact: true }),
+    });
+    assert.equal(alreadyRemoved.status, 409);
+    assert.deepEqual(await alreadyRemoved.json(), {
+      error: "ack_conflict", acked: 3, exact: true, messageId: "3", removed: 0, lastSeq: 3, size: 1,
+    });
+
+    const mismatchedGeneration = await fetch(`${base}/bridge/ack`, {
+      method: "POST", headers: { ...AUTH, "Content-Type": "application/json" }, body: JSON.stringify({ seq: 2, messageId: "stale-message-id", exact: true }),
+    });
+    assert.equal(mismatchedGeneration.status, 409);
+    assert.equal((await mismatchedGeneration.json()).removed, 0);
+    assert.deepEqual(queue.since(0).map(event => event.message.messageId), ["2"], "mismatched exact ACK must retain the current event");
+
+    for (const bad of ["[]", "null", '{"seq":"1"}', '{"seq":-1}', '{"seq":1.5}', '{"seq":99}', '{"seq":2,"exact":"yes"}', '{"seq":2,"exact":true}', "{}"]) {
       const response = await fetch(`${base}/bridge/ack`, {
         method: "POST", headers: { ...AUTH, "Content-Type": "application/json" }, body: bad,
       });
@@ -575,7 +1172,7 @@ test("POST /bridge/ack acknowledges ordered sequences and rejects invalid bodies
   });
 });
 
-test("POST /bridge/send routes send, react, and typing through the send handlers", async () => {
+test("POST /bridge/send routes channel, DM, react, and typing actions", async () => {
   await withServer({}, async (base, _queue, calls) => {
     const send = await fetch(`${base}/bridge/send`, {
       method: "POST", headers: { ...AUTH, "Content-Type": "application/json" },
@@ -583,6 +1180,13 @@ test("POST /bridge/send routes send, react, and typing through the send handlers
     });
     assert.equal(send.status, 200);
     assert.deepEqual(await send.json(), { ok: true, kind: "send", messageId: "900000000000000001", channelId: CHANNEL_ID });
+
+    const dm = await fetch(`${base}/bridge/send`, {
+      method: "POST", headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: "send_dm", userId: USER_ID, text: "private hi" }),
+    });
+    assert.equal(dm.status, 200);
+    assert.deepEqual(await dm.json(), { ok: true, kind: "send_dm", messageId: "900000000000000002", channelId: "900000000000000003" });
 
     const react = await fetch(`${base}/bridge/send`, {
       method: "POST", headers: { ...AUTH, "Content-Type": "application/json" },
@@ -597,7 +1201,48 @@ test("POST /bridge/send routes send, react, and typing through the send handlers
     });
     assert.equal(typing.status, 200);
     assert.deepEqual(await typing.json(), { ok: true, kind: "typing" });
-    assert.equal(calls.length, 3);
+    assert.equal(calls.length, 4);
+  });
+});
+
+test("POST /bridge/send routes proactive_send and rejects raw-route keys with 400", async () => {
+  await withServer({}, async (base, _queue, calls) => {
+    const ok = await fetch(`${base}/bridge/send`, {
+      method: "POST", headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: "proactive_send", requestId: REQUEST_ID, destination: "aidhd.porch", text: "hello", mentions: ["marta"] }),
+    });
+    assert.equal(ok.status, 200);
+    assert.deepEqual(await ok.json(), {
+      ok: true, kind: "proactive_send", requestId: REQUEST_ID,
+      destination: "aidhd.porch", messageId: "900000000000000010",
+    });
+
+    // Raw-route keys alongside proactive_send are rejected before the handler.
+    for (const rawKey of ["channel", "userId", "guildId", "replyToMessageId", "allowedMentions"]) {
+      const rejected = await fetch(`${base}/bridge/send`, {
+        method: "POST", headers: { ...AUTH, "Content-Type": "application/json" },
+        body: JSON.stringify({ kind: "proactive_send", requestId: REQUEST_ID, destination: "aidhd.porch", text: "hi", [rawKey]: CHANNEL_ID }),
+      });
+      assert.equal(rejected.status, 400, `raw key ${rawKey} must be rejected with 400`);
+    }
+    assert.equal(calls.length, 1, "only the valid proactive action reaches the handler");
+
+  });
+
+  // Unknown destinations surface as sanitized 422 policy failures.
+  const unknownDestination = new Error("Unknown proactive destination");
+  unknownDestination.name = "PolicyError";
+  await withServer({
+    sendHandlers: { proactiveSend: async () => { throw unknownDestination; } },
+  }, async base => {
+    const unknown = await fetch(`${base}/bridge/send`, {
+      method: "POST", headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: "proactive_send", requestId: REQUEST_ID, destination: "missing.place", text: "hi" }),
+    });
+    assert.equal(unknown.status, 422);
+    const body = await unknown.json();
+    assert.equal(body.error, "send_failed");
+    assert.equal(body.message, "Unknown proactive destination");
   });
 });
 
@@ -657,6 +1302,15 @@ test("bridge endpoints are rate limited independently", async () => {
     const limited = await fetch(`${base}/bridge/events`, { headers: AUTH });
     assert.equal(limited.status, 429);
     assert.ok(Number(limited.headers.get("retry-after")) >= 1);
+
+    // Exhausting the event-poll counter must not consume the allowance needed
+    // for the eventual ACK or an intentional outbound send.
+    const outbound = await fetch(`${base}/bridge/send`, {
+      method: "POST",
+      headers: { ...AUTH, "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: "send", channel: CHANNEL_ID, text: "still available" }),
+    });
+    assert.equal(outbound.status, 200);
   });
 });
 
@@ -686,4 +1340,30 @@ test("publicBridgeError exposes only policy and exact allowlisted failures", () 
   assert.equal(publicBridgeError(new Error("raw internals: DISCORD_TOKEN=abc")), "Discord operation failed");
   assert.equal(publicBridgeError("not an error"), "Request failed");
   assert.equal(publicBridgeError(null), "Request failed");
+});
+
+// --------------------------------------------- sendMessage hardening (mention policy)
+
+const MENTION_POLICY = {
+  ...POLICY,
+  allowedMentionUserIds: [USER_ID],
+  allowedMentionRoleIds: [BOYS_ROLE_ID],
+};
+
+test("message payload cannot have validated allowedMentions overridden by extra", () => {
+  const payload = buildMessagePayload("hi", [USER_ID], [BOYS_ROLE_ID], {
+    embeds: [{ title: "x" }],
+    allowedMentions: { parse: ["everyone", "roles", "users"], repliedUser: true },
+  });
+  assert.deepEqual(payload.embeds, [{ title: "x" }]);
+  assert.deepEqual(payload.allowedMentions, {
+    parse: [], users: [USER_ID], roles: [BOYS_ROLE_ID], repliedUser: false,
+  });
+});
+
+test("mention policy helpers deduplicate and validate IDs", () => {
+  assert.deepEqual(assertMentionUsersAllowed(MENTION_POLICY, [USER_ID, USER_ID]), [USER_ID]);
+  assert.deepEqual(assertMentionRolesAllowed(MENTION_POLICY, [BOYS_ROLE_ID, BOYS_ROLE_ID]), [BOYS_ROLE_ID]);
+  assert.throws(() => assertMentionUsersAllowed(MENTION_POLICY, ["not-a-snowflake"]), /not allowed/);
+  assert.throws(() => assertMentionRolesAllowed(MENTION_POLICY, ["not-a-snowflake"]), /not allowed/);
 });

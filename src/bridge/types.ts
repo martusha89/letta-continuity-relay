@@ -40,6 +40,8 @@ export interface InboundMessage {
   parentChannelId: string | null;
   authorId: string;
   authorName: string;
+  /** Trusted ingress classification; never inferred from message text. */
+  authorIsBot: boolean;
   /** Message text with the bot mention stripped. */
   text: string;
   attachments: BridgeAttachmentMetadata[];
@@ -67,12 +69,30 @@ export type IgnoreReason =
   | "guild_not_allowed"
   | "channel_not_allowed"
   | "dm_not_allowed"
+  | "bot_direct_mention_required"
+  | "bot_cooldown"
   | "not_addressed_to_bot"
   | "duplicate"
   | "queue_full";
 
-/** Action request accepted on POST /bridge/send. */
+/**
+ * Action request accepted on POST /bridge/send.
+ *
+ * `proactive_send` is the only action that accepts named destinations instead
+ * of raw snowflakes: the bridge resolves the destination alias (and optional
+ * mention aliases) server-side against the authoritative registry configured
+ * via DISCORD_BRIDGE_PROACTIVE_DESTINATIONS_JSON. Raw channel/user/role IDs
+ * are strictly rejected alongside it.
+ */
 export type BridgeSendAction =
   | { kind: "send"; channel: string; text: string; replyToMessageId?: string }
+  | { kind: "send_dm"; userId: string; text: string; replyToMessageId?: string }
+  | { kind: "proactive_send"; requestId: string; destination: string; text: string; mentions?: string[] }
   | { kind: "react"; channel: string; messageId: string; emoji: string }
   | { kind: "typing"; channel: string };
+
+/** Raw-route keys that must never accompany a proactive_send action. */
+export const PROACTIVE_RAW_ROUTE_KEYS = [
+  "channel", "channelId", "userId", "guildId", "roleId",
+  "replyToMessageId", "allowedMentions", "mentionUserIds", "mentionRoleIds",
+] as const;

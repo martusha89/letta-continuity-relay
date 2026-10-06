@@ -13,6 +13,7 @@
     "allowedChannelIds": ["234567890123456789"],
     "allowedDmUserIds": [],
     "allowedMentionUserIds": [],
+    "allowedMentionRoleIds": [],
     "allowLocalFiles": false,
     "allowedLocalRoots": []
   },

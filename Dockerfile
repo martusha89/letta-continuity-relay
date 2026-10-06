@@ -14,7 +14,8 @@ ENV NODE_ENV=production \
     MCP_TRANSPORT=http \
     MCP_HOST=0.0.0.0 \
     DISCORD_BRIDGE_ENABLED=true \
-    DISCORD_BRIDGE_ALLOW_EVERYONE=false
+    DISCORD_BRIDGE_ALLOW_EVERYONE=false \
+    DISCORD_BRIDGE_BOT_COOLDOWN_MS=30000
 WORKDIR /app
 COPY --from=build /app/package.json /app/package-lock.json ./
 COPY --from=build /app/node_modules ./node_modules

@@ -52,3 +52,13 @@ export function assertMentionUsersAllowed(policy: AccessPolicy, userIds: readonl
   }
   return unique;
 }
+
+export function assertMentionRolesAllowed(policy: AccessPolicy, roleIds: readonly string[]): string[] {
+  const unique = [...new Set(roleIds)];
+  for (const roleId of unique) {
+    if (!/^\d{17,20}$/.test(roleId) || !policy.allowedMentionRoleIds.includes(roleId)) {
+      throw new PolicyError("Mentioned role is not allowed by policy");
+    }
+  }
+  return unique;
+}

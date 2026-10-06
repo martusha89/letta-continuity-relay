@@ -259,7 +259,11 @@ function createMcpServer(): Server {
 
 let httpServer: HttpServer | undefined; let shuttingDown = false;
 async function shutdown(signal: string): Promise<void> {
-  if (shuttingDown) return; shuttingDown = true; console.error(`[shutdown] ${signal}`);
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const line = `[shutdown] ${signal}`;
+  if (cfg.transport === "stdio") console.error(line);
+  else console.log(line);
   await new Promise<void>(resolve => httpServer ? httpServer.close(() => resolve()) : resolve());
   client.destroy(); process.exitCode = 0;
 }
@@ -269,6 +273,9 @@ async function main() {
   await client.login(cfg.discordToken);
   if (cfg.transport === "stdio") { await createMcpServer().connect(new StdioServerTransport()); console.error("[mcp] running on stdio"); return; }
   const bridgeRuntime = cfg.bridge.enabled ? createBridgeRuntime(cfg, client) : undefined;
+  // Fail startup when any configured proactive destination is unknown,
+  // non-sendable, or in the wrong guild. No fuzzy fallback.
+  if (bridgeRuntime) await bridgeRuntime.ready;
   const app = createHttpApp({
     allowedOrigins: cfg.http.allowedOrigins,
     bearerToken: cfg.http.bearerToken!,
@@ -286,8 +293,8 @@ async function main() {
     logError: scope => console.error(`[${scope}] request rejected`),
   });
   httpServer = app.listen(cfg.http.port, cfg.http.host, () => {
-    console.error(`[mcp] Streamable HTTP listening on http://${cfg.http.host}:${cfg.http.port}/mcp`);
-    if (bridgeRuntime) console.error("[bridge] inbound bridge enabled; endpoints at /bridge/events, /bridge/ack, /bridge/send");
+    console.log(`[mcp] Streamable HTTP listening on http://${cfg.http.host}:${cfg.http.port}/mcp`);
+    if (bridgeRuntime) console.log("[bridge] inbound bridge enabled; endpoints at /bridge/events, /bridge/ack, /bridge/send");
   });
 }
 main().catch(error => { console.error("Fatal:", error instanceof Error ? error.message : "Startup failed"); client.destroy(); process.exitCode = 1; });

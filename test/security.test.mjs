@@ -1,11 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { isBlockedAddress } from "../build/discord/attachments.js";
-import { assertChannelAllowed, assertDmAllowed, assertMentionUsersAllowed, isChannelDiscoverable } from "../build/discord/policy.js";
+import { assertChannelAllowed, assertDmAllowed, assertMentionRolesAllowed, assertMentionUsersAllowed, isChannelDiscoverable } from "../build/discord/policy.js";
 import { bearerMatches } from "../build/http-security.js";
 import { normalizeTransport } from "../build/config.js";
 
-const policy = { allowedGuildIds: ["11111111111111111"], allowedChannelIds: ["22222222222222222"], allowedDmUserIds: ["33333333333333333"], allowedMentionUserIds: ["44444444444444444"], allowLocalFiles: false, allowedLocalRoots: [], remoteMode: true };
+const policy = { allowedGuildIds: ["11111111111111111"], allowedChannelIds: ["22222222222222222"], allowedDmUserIds: ["33333333333333333"], allowedMentionUserIds: ["44444444444444444"], allowedMentionRoleIds: ["55555555555555555"], allowLocalFiles: false, allowedLocalRoots: [], remoteMode: true };
 test("blocks non-public address ranges", () => {
   for (const ip of ["127.0.0.1", "10.1.2.3", "169.254.169.254", "192.168.1.1", "224.0.0.1", "::1", "fc00::1", "fe80::1", "ff02::1"]) assert.equal(isBlockedAddress(ip), true, ip);
   assert.equal(isBlockedAddress("8.8.8.8"), false);
@@ -31,6 +31,10 @@ test("DM recipients are deny-by-default", () => {
 test("outbound pings require explicit user or bot allowlisting", () => {
   assert.deepEqual(assertMentionUsersAllowed(policy, ["44444444444444444", "44444444444444444"]), ["44444444444444444"]);
   assert.throws(() => assertMentionUsersAllowed(policy, ["99999999999999999"]));
+});
+test("outbound role pings require explicit role allowlisting", () => {
+  assert.deepEqual(assertMentionRolesAllowed(policy, ["55555555555555555", "55555555555555555"]), ["55555555555555555"]);
+  assert.throws(() => assertMentionRolesAllowed(policy, ["99999999999999999"]));
 });
 test("a DM-only remote policy does not open every guild or channel", () => {
   const dmOnly = { ...policy, allowedGuildIds: [], allowedChannelIds: [] };
