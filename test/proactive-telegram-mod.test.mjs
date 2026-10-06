@@ -1,11 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { resolve, dirname } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
+import { importTypeScriptModule } from "./helpers/import-typescript-module.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const MODULE = pathToFileURL(resolve(ROOT, "deploy", "continuity-listener", "proactive-telegram.ts")).href;
-const proactiveModule = await import(`${MODULE}?test=${Date.now()}`);
+const proactiveModule = await importTypeScriptModule(
+  resolve(ROOT, "deploy", "continuity-listener", "proactive-telegram.ts"),
+);
 const { createProactiveTelegramTool, proactiveTelegramConfig } = proactiveModule;
 const TOKEN = "123456789:" + "a".repeat(35);
 const CHAT_ID = "8591783644";

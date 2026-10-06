@@ -1,11 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { resolve, dirname } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
+import { importTypeScriptModule } from "./helpers/import-typescript-module.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const MODULE = pathToFileURL(resolve(ROOT, "deploy", "continuity-listener", "proactive-discord.ts")).href;
-const proactiveModule = await import(`${MODULE}?test=${Date.now()}`);
+const proactiveModule = await importTypeScriptModule(
+  resolve(ROOT, "deploy", "continuity-listener", "proactive-discord.ts"),
+);
 const { createProactiveDiscordTool, proactiveDiscordConfig } = proactiveModule;
 const TOKEN = "bridge-secret-" + "b".repeat(32);
 
