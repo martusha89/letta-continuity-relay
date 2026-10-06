@@ -387,9 +387,15 @@ export default function activate(letta) {
       accountId: route.accountId ?? undefined,
       threadId: route.threadId ?? undefined,
       // Exact source correlation is transport provenance, not a model choice.
-      // Discord uses this both for human reply references and for persistent
-      // one-shot enforcement on companion-bot-origin turns.
-      ...(discordSource ? { replyToMessageId: route.messageId ?? undefined } : {}),
+      // `replyTo` is the public MessageChannel argument; the channel runtime
+      // normalizes it to `replyToMessageId` before calling the adapter. Keep
+      // the normalized spelling pinned too for runtimes that expose it at
+      // tool_start. The adapter uses that value both for human reply references
+      // and for persistent one-shot enforcement on companion-bot-origin turns.
+      ...(discordSource ? {
+        replyTo: route.messageId ?? undefined,
+        replyToMessageId: route.messageId ?? undefined,
+      } : {}),
       ...(discordSource && event.args.action === "react" ? { messageId: route.messageId ?? undefined } : {}),
     };
     delete rewritten.target;

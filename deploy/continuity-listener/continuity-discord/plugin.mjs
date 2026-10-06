@@ -16,6 +16,7 @@ const DELIVERY_CONCURRENCY = 4;
 const DELIVERY_QUARANTINE_LIMIT = 4;
 const DELIVERY_TIMEOUT_MS = 30_000;
 const PENDING_POLL_DELAY_MS = 2_000;
+const TURN_LIFECYCLE_TIMEOUT_MS = 20 * 60_000;
 const BOT_REPLY_LEDGER_TTL_MS = 7 * 24 * 60 * 60_000;
 const BOT_REPLY_LEDGER_LIMIT = 4096;
 const LEDGER_LOCK_STALE_MS = 30_000;
@@ -543,12 +544,20 @@ export function parseAccountConfig(account) {
     }
     return value;
   };
+  const boolean = (name, fallback) => {
+    const value = raw[name] === undefined ? fallback : raw[name];
+    if (typeof value !== "boolean") {
+      throw new Error(`Discord bridge ${name} is invalid`);
+    }
+    return value;
+  };
   const typingRefreshMs = integer("typing_refresh_ms", TYPING_REFRESH_MS, 5, 60_000);
   const typingMaxDurationMs = integer("typing_max_duration_ms", TYPING_MAX_DURATION_MS, 10, 60 * 60_000);
   const deliveryConcurrency = integer("delivery_concurrency", DELIVERY_CONCURRENCY, 2, 32);
   const deliveryQuarantineLimit = integer("delivery_quarantine_limit", DELIVERY_QUARANTINE_LIMIT, 1, 32);
   const deliveryTimeoutMs = integer("delivery_timeout_ms", DELIVERY_TIMEOUT_MS, 100, 10 * 60_000);
   const pendingPollDelayMs = integer("pending_poll_delay_ms", PENDING_POLL_DELAY_MS, 10, 60_000);
+  const turnLifecycleTimeoutMs = integer("turn_lifecycle_timeout_ms", TURN_LIFECYCLE_TIMEOUT_MS, 100, 2 * 60 * 60_000);
   if (typingMaxDurationMs < typingRefreshMs) {
     throw new Error("Discord bridge typing_max_duration_ms must be at least typing_refresh_ms");
   }
@@ -560,6 +569,12 @@ export function parseAccountConfig(account) {
     requestTimeoutMs: integer("request_timeout_ms", 30000, 1000, 120000),
     minBackoffMs: integer("min_backoff_ms", 500, 100, 30000),
     maxBackoffMs: integer("max_backoff_ms", 10000, 500, 120000),
+    // Every configured Discord route currently converges on one Letta
+    // conversation. Keep the next bridge event queued until that conversation
+    // emits a terminal lifecycle event for the current source. Merely awaiting
+    // adapter.onMessage is insufficient: Letta returns after enqueueing the
+    // turn, before its tools and final response have settled.
+    serializeTurns: boolean("serialize_turns", true),
     typingRefreshMs,
     typingMaxDurationMs,
     deliveryConcurrency,
@@ -567,6 +582,7 @@ export function parseAccountConfig(account) {
     deliveryMaxUnresolved: deliveryConcurrency + deliveryQuarantineLimit,
     deliveryTimeoutMs,
     pendingPollDelayMs,
+    turnLifecycleTimeoutMs,
   };
 }
 
@@ -767,6 +783,7 @@ export function createContinuityDiscordAdapter(account, options = {}) {
         retryState: new Map(),
         directChannelIds: new Map(),
         sourceMessageIds: new Set(),
+        sourceLifecycles: new Map(),
         loopPromise: null,
         stopped: false,
       };
@@ -794,6 +811,8 @@ export function createContinuityDiscordAdapter(account, options = {}) {
       run.pendingDeliveries.clear();
       run.retryState.clear();
       run.directChannelIds.clear();
+      for (const lifecycle of run.sourceLifecycles.values()) clearTimeout(lifecycle.timeout);
+      run.sourceLifecycles.clear();
       run.sourceMessageIds.clear();
       try { await run.loopPromise; } catch {}
       startupLogger(`${LOG_PREFIX} bridge listener stopped`);
@@ -808,14 +827,14 @@ export function createContinuityDiscordAdapter(account, options = {}) {
         if (run.sourceMessageIds.has(event.source?.messageId)) typing.start(event.source);
         return;
       }
-      const currentSources = event.sources.filter(source => run.sourceMessageIds.has(source?.messageId));
+      const eventSources = Array.isArray(event.sources) ? event.sources : [];
+      const currentSources = eventSources.filter(source => run.sourceMessageIds.has(source?.messageId));
       if (event.type === "processing") {
         for (const source of currentSources) typing.start(source);
         return;
       }
       for (const source of currentSources) {
-        typing.stop(source);
-        run.sourceMessageIds.delete(source.messageId);
+        releaseTurnSource(run, source.messageId);
       }
     },
 
@@ -906,6 +925,32 @@ export function createContinuityDiscordAdapter(account, options = {}) {
     return false;
   }
 
+  function turnIsPending(run) {
+    return config.serializeTurns && run.sourceMessageIds.size > 0;
+  }
+
+  function trackTurnSource(run, source) {
+    const messageId = source.messageId;
+    run.sourceMessageIds.add(messageId);
+    const timeout = setTimeout(() => {
+      if (!isCurrentRun(run) || !run.sourceMessageIds.has(messageId)) return;
+      releaseTurnSource(run, messageId);
+      startupLogger(`${LOG_PREFIX} turn source ${messageId} exceeded ${config.turnLifecycleTimeoutMs}ms without a terminal lifecycle event; stale serialization gate released`);
+    }, config.turnLifecycleTimeoutMs);
+    timeout.unref?.();
+    run.sourceLifecycles.set(messageId, { source, timeout });
+  }
+
+  function releaseTurnSource(run, messageId) {
+    const lifecycle = run.sourceLifecycles.get(messageId);
+    if (lifecycle) {
+      clearTimeout(lifecycle.timeout);
+      typing.stop(lifecycle.source);
+      run.sourceLifecycles.delete(messageId);
+    }
+    run.sourceMessageIds.delete(messageId);
+  }
+
   function startDelivery(event, run) {
     const messageId = event.message.messageId;
     if (run.pendingDeliveries.has(messageId)) return false;
@@ -917,7 +962,7 @@ export function createContinuityDiscordAdapter(account, options = {}) {
     // Persist source classification before handing the turn to Letta. Unknown
     // or expired origins fail closed rather than silently becoming human turns.
     botReplies.register(inbound.messageId, inbound.chatId, inbound.raw.discord.authorIsBot);
-    run.sourceMessageIds.add(messageId);
+    trackTurnSource(run, inbound);
     const dmChannelId = inbound.chatType === "direct" ? inbound.raw?.discord?.channelId : null;
     if (SNOWFLAKE.test(dmChannelId ?? "")) run.directChannelIds.set(inbound.chatId, dmChannelId);
     typing.start(inbound);
@@ -967,7 +1012,7 @@ export function createContinuityDiscordAdapter(account, options = {}) {
         }
       } finally {
         clearTimeout(entry.timeout);
-        if (!entry.accepted) run.sourceMessageIds.delete(messageId);
+        if (!entry.accepted) releaseTurnSource(run, messageId);
         if (run.pendingDeliveries.get(messageId) === entry) run.pendingDeliveries.delete(messageId);
         unresolvedDeliveries.delete(unresolvedId);
       }
@@ -989,6 +1034,13 @@ export function createContinuityDiscordAdapter(account, options = {}) {
         const events = [...result.events].sort((a, b) => a.seq - b.seq);
         let launched = 0;
         for (const event of events) {
+          // A delivered event is not finished merely because onMessage
+          // returned. Letta's inbound router enqueues the agent turn and then
+          // resolves immediately. Starting another event before the terminal
+          // lifecycle callback can corrupt the shared conversation's pending
+          // tool-call state, so serialized deployments stop here and leave the
+          // remaining bridge events durably unacknowledged.
+          if (turnIsPending(run)) break;
           const messageId = event.message.messageId;
           if (run.pendingDeliveries.has(messageId)) continue;
           const retry = run.retryState.get(messageId);

@@ -79,6 +79,8 @@ test("continuity listener seed creates private Telegram and Discord routes into 
   assert.equal(discord.accounts[0].channel, "cass-discord");
   assert.equal(discord.accounts[0].config.base_url, "http://discord-bridge.railway.internal:3001");
   assert.equal(discord.accounts[0].config.auth, BRIDGE_TOKEN);
+  assert.equal(discord.accounts[0].config.serialize_turns, true);
+  assert.equal(discord.accounts[0].config.turn_lifecycle_timeout_ms, 1200000);
   const discordRoutes = await readJson(join(discordDir, "routing.yaml"));
   assert.deepEqual(discordRoutes.routes.map(route => route.chatId), [FIRST_CHANNEL]);
   assert.equal(discordRoutes.routes[0].agentId, AGENT_ID);
@@ -370,13 +372,19 @@ test("generic route guard pins MessageChannel calls to the inbound source", asyn
       conversationId: "default",
       toolCallId: "discord-call",
       toolName: "MessageChannel",
-      args: { action: "send", channel: "telegram", chat_id: "444444444444444444" },
+      args: {
+        action: "send",
+        channel: "telegram",
+        chat_id: "444444444444444444",
+        replyTo: "model-selected-wrong-source",
+      },
     }, {
       conversation: { async getHistory() { return concurrentHistory; } },
     });
     assert.equal(switched.args.channel, "cass-discord");
     assert.equal(switched.args.chat_id, "888888888888888888");
     assert.equal(switched.args.accountId, "main");
+    assert.equal(switched.args.replyTo, "100");
     assert.equal(switched.args.replyToMessageId, "100");
 
     const pinnedReaction = await handlers.get("tool_start")({
@@ -390,6 +398,7 @@ test("generic route guard pins MessageChannel calls to the inbound source", asyn
     });
     assert.equal(pinnedReaction.args.channel, "cass-discord");
     assert.equal(pinnedReaction.args.chat_id, "888888888888888888");
+    assert.equal(pinnedReaction.args.replyTo, "100");
     assert.equal(pinnedReaction.args.replyToMessageId, "100");
     assert.equal(pinnedReaction.args.messageId, "100");
 

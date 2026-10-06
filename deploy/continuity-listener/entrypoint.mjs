@@ -344,6 +344,8 @@ Object.assign(discordAccount, {
     min_backoff_ms: 500,
     max_backoff_ms: 10000,
     pending_poll_delay_ms: 2000,
+    serialize_turns: true,
+    turn_lifecycle_timeout_ms: 1200000,
   },
   updatedAt: now,
 });
