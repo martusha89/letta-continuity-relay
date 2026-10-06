@@ -40,6 +40,19 @@ export default defineRailway(() => {
         description: "Required comma-separated 17–20 digit Discord channel or forum-parent IDs.",
         isOptional: false,
       },
+      DISCORD_ALLOWED_MENTION_USER_IDS: {
+        description: "Optional comma-separated user/bot IDs that configured proactive destinations may notify.",
+        isOptional: true,
+      },
+      DISCORD_ALLOWED_MENTION_ROLE_IDS: {
+        description: "Optional comma-separated role IDs that configured proactive destinations may notify.",
+        isOptional: true,
+      },
+      DISCORD_BRIDGE_PROACTIVE_DESTINATIONS_JSON: {
+        description: "Optional strict JSON registry of named proactive destinations and destination-scoped mention aliases.",
+        isOptional: true,
+        isSealed: true,
+      },
     },
   });
 

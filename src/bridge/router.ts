@@ -2,12 +2,15 @@ import express from "express";
 import type { NextFunction, Request, Response } from "express";
 import { bearerMatches, fixedWindowRateLimit } from "../http-security.js";
 import { publicBridgeError } from "../public-error.js";
-import type { BridgeConfig } from "../config.js";
+import { normalizeDestinationAlias, type BridgeConfig } from "../config.js";
 import type { BridgeEventQueue } from "./queue.js";
 import type { BridgeSendAction } from "./types.js";
+import { PROACTIVE_RAW_ROUTE_KEYS } from "./types.js";
 
 export interface BridgeSendHandlers {
   send: (action: Extract<BridgeSendAction, { kind: "send" }>) => Promise<{ messageId: string; channelId: string }>;
+  sendDm: (action: Extract<BridgeSendAction, { kind: "send_dm" }>) => Promise<{ messageId: string; channelId: string }>;
+  proactiveSend: (action: Extract<BridgeSendAction, { kind: "proactive_send" }>) => Promise<{ messageId: string; channelId: string; destination: string; requestId: string }>;
   react: (action: Extract<BridgeSendAction, { kind: "react" }>) => Promise<void>;
   typing: (action: Extract<BridgeSendAction, { kind: "typing" }>) => Promise<void>;
 }
@@ -46,9 +49,11 @@ export function createBridgeRouter(options: BridgeRouterOptions): express.Router
     next();
   });
 
-  // Dedicated rate limit for bridge endpoints (long polls hold a request but
-  // only count once per poll).
-  router.use(fixedWindowRateLimit(bridge.rateLimitPerMinute));
+  // Long polls and outbound actions use separate counters. A pending event can
+  // make /events return immediately, and those polls must never consume the
+  // allowance needed for the eventual ACK or an intentional outbound send.
+  const eventRateLimit = fixedWindowRateLimit(bridge.rateLimitPerMinute);
+  const actionRateLimit = fixedWindowRateLimit(bridge.rateLimitPerMinute);
 
   // JSON body parsing with an explicit limit; only for POST endpoints.
   router.use((req: Request, res: Response, next: NextFunction): void => {
@@ -61,7 +66,7 @@ export function createBridgeRouter(options: BridgeRouterOptions): express.Router
   });
   router.use(express.json({ limit: bridge.jsonLimitBytes, strict: true, type: ["application/json", "application/*+json"] }));
 
-  router.get("/events", async (req: Request, res: Response): Promise<void> => {
+  router.get("/events", eventRateLimit, async (req: Request, res: Response): Promise<void> => {
     const afterRaw = typeof req.query.after === "string" ? req.query.after : "0";
     if (!/^\d+$/.test(afterRaw)) {
       res.status(400).json({ error: "invalid_request" });
@@ -87,22 +92,51 @@ export function createBridgeRouter(options: BridgeRouterOptions): express.Router
     res.status(200).json({ events, lastSeq: queue.lastSeq, dropped: queue.dropped, reset });
   });
 
-  router.post("/ack", (req: Request, res: Response): void => {
+  router.post("/ack", actionRateLimit, (req: Request, res: Response): void => {
     const body = req.body;
     if (body === undefined || body === null || typeof body !== "object" || Array.isArray(body)) {
       res.status(400).json({ error: "invalid_request" });
       return;
     }
     const seq = (body as { seq?: unknown }).seq;
+    const exact = (body as { exact?: unknown }).exact;
+    const messageId = (body as { messageId?: unknown }).messageId;
     if (typeof seq !== "number" || !Number.isInteger(seq) || seq < 0 || seq > queue.lastSeq) {
       res.status(400).json({ error: "invalid_request" });
       return;
     }
-    const removed = queue.ack(seq);
-    res.status(200).json({ acked: seq, removed, lastSeq: queue.lastSeq, size: queue.size });
+    if (exact !== undefined && typeof exact !== "boolean") {
+      res.status(400).json({ error: "invalid_request" });
+      return;
+    }
+    if (exact === true && (typeof messageId !== "string" || messageId.length === 0)) {
+      res.status(400).json({ error: "invalid_request" });
+      return;
+    }
+    const removed = exact ? queue.ackOne(seq, messageId as string) : queue.ack(seq);
+    if (exact === true && removed !== 1) {
+      res.status(409).json({
+        error: "ack_conflict",
+        acked: seq,
+        exact: true,
+        messageId,
+        removed,
+        lastSeq: queue.lastSeq,
+        size: queue.size,
+      });
+      return;
+    }
+    res.status(200).json({
+      acked: seq,
+      exact: exact === true,
+      ...(exact === true ? { messageId } : {}),
+      removed,
+      lastSeq: queue.lastSeq,
+      size: queue.size,
+    });
   });
 
-  router.post("/send", async (req: Request, res: Response): Promise<void> => {
+  router.post("/send", actionRateLimit, async (req: Request, res: Response): Promise<void> => {
     const body = req.body;
     if (body === undefined || body === null || typeof body !== "object" || Array.isArray(body)) {
       res.status(400).json({ error: "invalid_request" });
@@ -114,9 +148,20 @@ export function createBridgeRouter(options: BridgeRouterOptions): express.Router
       return;
     }
     try {
-      if (action.kind === "send") {
-        const result = await sendHandlers.send(action);
-        res.status(200).json({ ok: true, kind: "send", messageId: result.messageId, channelId: result.channelId });
+      if (action.kind === "send" || action.kind === "send_dm") {
+        const result = action.kind === "send"
+          ? await sendHandlers.send(action)
+          : await sendHandlers.sendDm(action);
+        res.status(200).json({ ok: true, kind: action.kind, messageId: result.messageId, channelId: result.channelId });
+      } else if (action.kind === "proactive_send") {
+        const result = await sendHandlers.proactiveSend(action);
+        res.status(200).json({
+          ok: true,
+          kind: "proactive_send",
+          requestId: result.requestId,
+          destination: result.destination,
+          messageId: result.messageId,
+        });
       } else if (action.kind === "react") {
         await sendHandlers.react(action);
         res.status(200).json({ ok: true, kind: "react" });
@@ -139,9 +184,10 @@ export function createBridgeRouter(options: BridgeRouterOptions): express.Router
 }
 
 /**
- * Validate a /bridge/send body. Only `send` and `react` are supported; the
- * listener can extend this later. Upload-file is intentionally omitted until
- * it can be done safely with existing source restrictions.
+ * Validate a /bridge/send body. `send`, `send_dm`, `react`, and `typing` take
+ * exact snowflakes; `proactive_send` takes only named aliases and strictly
+ * rejects raw-route keys. Upload-file is intentionally omitted until it can be
+ * done safely with existing source restrictions.
  */
 export function parseSendAction(body: Record<string, unknown>): BridgeSendAction | null {
   const kind = body.kind;
@@ -155,6 +201,43 @@ export function parseSendAction(body: Record<string, unknown>): BridgeSendAction
     return replyToMessageId !== undefined
       ? { kind: "send", channel, text, replyToMessageId }
       : { kind: "send", channel, text };
+  }
+  if (kind === "send_dm") {
+    const userId = body.userId;
+    const text = body.text;
+    if (typeof userId !== "string" || !SNOWFLAKE.test(userId)) return null;
+    if (typeof text !== "string" || text.length === 0) return null;
+    const replyToMessageId = body.replyToMessageId;
+    if (replyToMessageId !== undefined && (typeof replyToMessageId !== "string" || !SNOWFLAKE.test(replyToMessageId))) return null;
+    return replyToMessageId !== undefined
+      ? { kind: "send_dm", userId, text, replyToMessageId }
+      : { kind: "send_dm", userId, text };
+  }
+  if (kind === "proactive_send") {
+    const destination = body.destination;
+    const text = body.text;
+    const requestId = body.requestId;
+    if (typeof requestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)) return null;
+    if (typeof destination !== "string") return null;
+    const normalizedDestination = normalizeDestinationAlias(destination);
+    if (!normalizedDestination) return null;
+    if (typeof text !== "string" || text.length === 0) return null;
+    const allowedKeys = new Set(["kind", "requestId", "destination", "text", "mentions"]);
+    if (Object.keys(body).some(key => !allowedKeys.has(key))) return null;
+    // Strictly reject raw-route keys: proactive sends may never carry raw
+    // channel/user/role IDs, reply targets, or mention overrides.
+    for (const key of PROACTIVE_RAW_ROUTE_KEYS) {
+      if (body[key] !== undefined) return null;
+    }
+    const mentions = body.mentions;
+    if (mentions !== undefined) {
+      if (!Array.isArray(mentions) || mentions.some(m => typeof m !== "string" || m.length === 0)) return null;
+      const normalized = mentions.map(m => normalizeDestinationAlias(m));
+      if (normalized.some(m => !m)) return null;
+      if (new Set(normalized).size !== normalized.length) return null;
+      return { kind: "proactive_send", requestId, destination: normalizedDestination, text, mentions: normalized as string[] };
+    }
+    return { kind: "proactive_send", requestId, destination: normalizedDestination, text };
   }
   if (kind === "react") {
     const channel = body.channel;

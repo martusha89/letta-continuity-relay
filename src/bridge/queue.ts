@@ -66,6 +66,20 @@ export class BridgeEventQueue {
   }
 
   /**
+   * Acknowledge one event without removing older uncompleted events. This is
+   * used by concurrent listeners so a stalled delivery cannot head-of-line
+   * block unrelated chats while the older event remains available for retry.
+   */
+  ackOne(seq: number, messageId?: string): number {
+    if (!Number.isInteger(seq) || seq < 0) return 0;
+    const index = this.events.findIndex(event =>
+      event.seq === seq && (messageId === undefined || event.message.messageId === messageId));
+    if (index === -1) return 0;
+    this.events.splice(index, 1);
+    return 1;
+  }
+
+  /**
    * Long-poll: resolve immediately if events after `after` exist; otherwise
    * wait until one arrives or `timeoutMs` elapses (then resolve with []).
    */

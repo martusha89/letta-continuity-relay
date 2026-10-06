@@ -51,8 +51,11 @@ DISCORD_BRIDGE_ENABLED=true
 DISCORD_BRIDGE_BEARER_TOKEN=${{secret(64)}}
 DISCORD_ALLOWED_DM_USER_IDS=
 DISCORD_ALLOWED_MENTION_USER_IDS=
+DISCORD_ALLOWED_MENTION_ROLE_IDS=
+DISCORD_BRIDGE_PROACTIVE_DESTINATIONS_JSON=
 DISCORD_BRIDGE_DM_USER_IDS=
 DISCORD_BRIDGE_ROLE_IDS=
+DISCORD_BRIDGE_BOT_COOLDOWN_MS=30000
 DISCORD_BRIDGE_ALLOW_EVERYONE=false
 ```
 
@@ -62,9 +65,21 @@ the Discord token or either bearer token in another field.
 ### Optional expert inputs
 
 - `DISCORD_BRIDGE_ROLE_IDS`: exact roles whose mentions wake the agent.
+- `DISCORD_BRIDGE_BOT_COOLDOWN_MS`: per-bot/channel ingress cooldown, from
+  1,000 to 3,600,000 milliseconds (default 30,000). Bots can reach ingress only
+  inside the existing Discord permission and routed-channel boundary, and only
+  by directly mentioning the relay; bot replies, role mentions,
+  `@everyone`/`@here`, ambient chatter, DMs, self messages, webhooks, and system
+  messages stay blocked.
 - `DISCORD_BRIDGE_ALLOW_EVERYONE`: keep `false` unless every `@everyone` and
   `@here` message should enter the selected agent conversation.
 - `DISCORD_ALLOWED_MENTION_USER_IDS`: users/bots the MCP may deliberately ping.
+- `DISCORD_ALLOWED_MENTION_ROLE_IDS`: roles that a configured proactive
+  destination may deliberately ping.
+- `DISCORD_BRIDGE_PROACTIVE_DESTINATIONS_JSON`: strict named-destination
+  registry used by the listener's proactive Discord tool. Keep raw Discord IDs
+  inside this bridge-side configuration; the agent calls only destination and
+  mention aliases.
 - `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID`: only when Discord voice-note
   output is wanted.
 
@@ -75,8 +90,9 @@ outbound identity mapping must be validated separately before exposure.
 
 Attach `continuity-state` at `/root`. In the Template Composer service settings,
 set **Healthcheck Path** to `/ready` and **Healthcheck Timeout** to `180`
-seconds for runtime installation and channel startup. The image's Docker
-`/health` check is process liveness only.
+seconds for process startup. `/ready` proves only that the Letta child spawned
+and has not exited; it does not prove channel, mod, or end-to-end message
+delivery. The image's Docker `/health` check is bootstrap-process liveness only.
 
 ### Required user inputs
 
@@ -118,11 +134,18 @@ Do not put the Discord token or MCP bearer token on the listener service.
    Intent, invite it to the server, and grant only the channel permissions it
    needs.
 4. Copy the Discord server/channel snowflakes with Developer Mode.
-5. Optionally attach the public bridge MCP endpoint if proactive Discord
-   read/list/file/sticker/status tools are desired. Generate a Railway domain
-   for `discord-bridge`, use `https://<generated-domain>/mcp`, and authenticate
-   with `Authorization: Bearer <MCP_HTTP_BEARER_TOKEN>` in the chosen MCP host.
-   Channel replies do not require this optional MCP attachment.
+5. Do **not** attach the general public bridge MCP endpoint to the continuity
+   agent. That endpoint includes raw-target send/DM/reaction/file tools which
+   bypass both reply-route pinning and the named proactive registry. Reserve it
+   for a separate trusted administrative agent or human-operated MCP client.
+   The continuity agent needs neither it for replies nor for named proactive
+   sends.
+
+The listener may expose two explicit proactive tools without weakening
+`MessageChannel`: alias-only Discord outreach and a fixed-destination private
+Telegram update. The Telegram tool accepts message text only, always targets
+`TELEGRAM_CHAT_ID`, never retries ambiguous delivery, and must not be described
+as obligatory reporting, surveillance, or automatic cross-channel mirroring.
 
 The setup UI and template overview must state these prerequisites before the
 user deploys. Do not market this as zero-configuration.

@@ -9,12 +9,43 @@ The listener is deliberately single-purpose:
 
 - seed one allowlisted Telegram private chat;
 - seed exact Discord channel routes;
-- install the audited bridge plugin as the distinct `continuity-discord` custom channel under the generic display
-  name **Continuity Discord**;
+- install the audited bridge plugin under the existing production channel ID
+  `cass-discord` and generic display name **Continuity Discord**;
 - install a deterministic reply-route guard scoped to the selected agent and
   conversation;
-- start one `letta server` process with `telegram,continuity-discord`;
+- start one `letta server` process with `telegram,cass-discord`;
 - retain account, route, pairing, and listener state on a `/root` volume.
+
+## Deliberate proactive Discord messages
+
+Ordinary `MessageChannel` replies remain pinned to the verified inbound route.
+The listener also installs a separate `proactive_discord_send` tool for the
+agent to initiate a new Discord message deliberately from a Desktop, scheduled,
+Telegram, or otherwise unrouted turn.
+
+The proactive tool accepts only a configured destination alias (for example
+`aidhd.porch`) plus optional configured mention aliases. It never accepts raw
+Discord channel, user, or role IDs. The bridge resolves and verifies those
+aliases server-side, applies the existing Discord policy allowlists, and returns
+a real Discord message ID. Unknown destinations or mentions fail without a
+fallback or history-based guess.
+
+This is intentionally a separate tool rather than an escape hatch in ordinary
+`MessageChannel.send`: prose alone cannot convert a reply into a cross-channel
+post, and the deterministic reply-route guard remains unchanged.
+
+## Deliberate private Telegram updates
+
+The listener also installs `proactive_telegram_send`, a fixed-destination tool
+for brief, deliberate private updates to the configured `TELEGRAM_CHAT_ID` from
+another routed context. The model supplies only `message`; it cannot choose a
+different chat, token, parse mode, or Telegram method.
+
+This is an optional communication ability, not an obligation to mirror public
+conversation, report activity, monitor people, or manufacture contact. Ordinary
+Telegram and Discord replies still use route-pinned `MessageChannel`. Telegram
+`sendMessage` has no idempotency key, so the tool never retries an ambiguous
+transport failure and explicitly reports unknown delivery status instead.
 
 ## Railway service shape
 
@@ -48,8 +79,8 @@ services.
 | --- | --- |
 | `LETTA_API_KEY` | Letta Cloud API key able to access the selected agent. |
 | `LETTA_AGENT_ID` | Exact target agent ID. |
-| `TELEGRAM_BOT_TOKEN` | Token from Telegram BotFather. Stored only in the mode-0600 account file on the volume. |
-| `TELEGRAM_CHAT_ID` | Exact private Telegram chat to route. |
+| `TELEGRAM_BOT_TOKEN` | Token from Telegram BotFather. Stored only in the mode-0600 account file on the volume and used by the fixed proactive Telegram tool. |
+| `TELEGRAM_CHAT_ID` | Exact private Telegram chat to route and the only destination available to `proactive_telegram_send`. |
 | `DISCORD_BRIDGE_BASE_URL` | Absolute HTTP(S) URL of the companion Discord bridge service. Use Railway private networking where possible. |
 | `DISCORD_BRIDGE_BEARER_TOKEN` | Shared bridge secret, at least 32 characters and identical on both services. |
 | `DISCORD_CHANNEL_IDS` | Comma-separated Discord channel/forum-parent IDs routed into the target conversation. Each must be a 17–20 digit snowflake. |

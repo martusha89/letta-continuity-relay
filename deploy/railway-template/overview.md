@@ -29,6 +29,10 @@ upgrade.
 - Keep Discord ingress limited to explicit mentions, replies, and optional
   allowlisted role/`@everyone` triggers.
 - Preserve cross-channel context while preventing stale-route reply leaks.
+- Let the agent deliberately initiate Discord outreach through verified named
+  destinations without exposing raw Discord IDs to the agent.
+- Permit deliberate private context or safety updates to the one configured
+  Telegram chat without weakening ordinary route pinning.
 
 ## Dependencies
 
@@ -45,6 +49,16 @@ Run one replica of each service. Do not reuse either bot token in another
 gateway or poller. Discord event delivery is currently an in-memory,
 best-effort queue rather than a durable message broker. Discord DMs are disabled
 in the beginner configuration.
+
+Do **not** attach the bridge's general MCP endpoint to the continuity agent. It
+contains raw-target send, DM, reaction, typing, file, and sticker tools that do
+not pass through deterministic reply pinning or the named proactive registry.
+Reserve that administrative MCP surface for a separate trusted agent or a
+human-operated client.
+
+The fixed proactive Telegram tool is an optional ability, not surveillance or
+an obligation to mirror Discord activity into a private chat. It accepts only
+message text and can reach only the template's configured Telegram chat.
 
 Deployment is not complete when both services merely turn green. Test
 Telegram → agent → Telegram, Discord → agent → Discord, an immediate switch

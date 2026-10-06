@@ -11,6 +11,19 @@ const snowflake = z.string().regex(/^\d{17,20}$/, "must be a Discord snowflake")
 const nonNegativeInt = z.number().int().nonnegative();
 const positiveInt = z.number().int().positive();
 
+const DESTINATION_ALIAS_PATTERN = /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/;
+const SNOWFLAKE_PATTERN = /^\d{17,20}$/;
+
+const proactiveMentionSchema = z.object({
+  kind: z.enum(["user", "role"]),
+  id: snowflake,
+}).strict();
+const proactiveDestinationSchema = z.object({
+  guildId: snowflake,
+  channelId: snowflake,
+  mentions: z.record(z.string(), proactiveMentionSchema).optional(),
+}).strict();
+
 const fileSchema = z.object({
   elevenlabs: z.object({
     voiceId: z.string().default(""),
@@ -26,6 +39,7 @@ const fileSchema = z.object({
     allowedChannelIds: z.array(snowflake).default([]),
     allowedDmUserIds: z.array(snowflake).default([]),
     allowedMentionUserIds: z.array(snowflake).default([]),
+    allowedMentionRoleIds: z.array(snowflake).default([]),
     allowLocalFiles: z.boolean().default(false),
     allowedLocalRoots: z.array(z.string().min(1)).default([]),
   }).partial().optional(),
@@ -56,10 +70,32 @@ export interface AccessPolicy {
   allowedChannelIds: string[];
   allowedDmUserIds: string[];
   allowedMentionUserIds: string[];
+  allowedMentionRoleIds: string[];
   allowLocalFiles: boolean;
   allowedLocalRoots: string[];
   remoteMode: boolean;
 }
+
+/** A mention alias resolved server-side from a proactive destination registry. */
+export interface ProactiveMention {
+  kind: "user" | "role";
+  id: string;
+}
+
+/**
+ * A named proactive destination. Callers only ever see the alias; the raw
+ * guild/channel/mention IDs never leave the bridge configuration.
+ */
+export interface ProactiveDestination {
+  alias: string;
+  guildId: string;
+  channelId: string;
+  /** Destination-scoped mention aliases, normalized lowercase. */
+  mentions: Map<string, ProactiveMention>;
+}
+
+/** Normalized proactive destination registry keyed by normalized alias. */
+export type ProactiveDestinationRegistry = Map<string, ProactiveDestination>;
 export interface LimitsConfig {
   messageChars: number;
   ttsChars: number;
@@ -80,8 +116,12 @@ export interface BridgeConfig {
   channelIds: string[];
   /** Guild roles whose mention deliberately addresses the bot. */
   roleIds: string[];
+  /** Minimum interval between accepted messages from one bot in one channel/thread. */
+  botCooldownMs: number;
   /** Whether @everyone and @here deliberately address the bot. */
   allowEveryone: boolean;
+  /** Authoritative named-destination registry for proactive_send. Empty = feature off. */
+  proactiveDestinations: ProactiveDestinationRegistry;
   queueLimit: number;
   pollTimeoutMs: number;
   jsonLimitBytes: number;
@@ -164,6 +204,71 @@ function parseBoolean(name: string, value: string | undefined, fallback = false)
   throw new Error(`${name} must be true or false`);
 }
 
+/**
+ * Normalize a destination or mention alias: lowercase, trimmed, and matched
+ * against a restrictive pattern that also rejects snowflake-shaped strings.
+ * Returns null for empty/whitespace-only values.
+ */
+export function normalizeDestinationAlias(value: string): string | null {
+  const normalized = value.trim().toLowerCase();
+  if (normalized.length === 0) return null;
+  if (!DESTINATION_ALIAS_PATTERN.test(normalized)) return null;
+  if (SNOWFLAKE_PATTERN.test(normalized)) return null;
+  return normalized;
+}
+
+/**
+ * Parse DISCORD_BRIDGE_PROACTIVE_DESTINATIONS_JSON (strict JSON, no trailing
+ * commas or comments) into a normalized destination registry. An omitted or
+ * empty value is valid and yields an empty registry (feature off).
+ *
+ * Every alias is normalized (lowercase, trimmed) and duplicate normalized
+ * aliases — including case-variants like "Porch" and "porch" — are rejected.
+ * Mention aliases are destination-scoped; the same alias may mean different
+ * targets in different destinations, but never twice within one destination.
+ */
+export function parseProactiveDestinations(name: string, value: string | undefined): ProactiveDestinationRegistry {
+  const registry: ProactiveDestinationRegistry = new Map();
+  if (value === undefined) return registry;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return registry;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    throw new Error(`${name} must be strict JSON`);
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`${name} must be a JSON object of named destinations`);
+  }
+  for (const [rawAlias, rawDestination] of Object.entries(parsed as Record<string, unknown>)) {
+    const alias = normalizeDestinationAlias(rawAlias);
+    if (alias === null) {
+      throw new Error(`${name} contains an invalid destination alias: ${JSON.stringify(rawAlias)}`);
+    }
+    if (registry.has(alias)) {
+      throw new Error(`${name} contains a duplicate destination alias after normalization: ${alias}`);
+    }
+    const destination = proactiveDestinationSchema.safeParse(rawDestination);
+    if (!destination.success) {
+      throw new Error(`${name} destination "${alias}" is invalid: ${destination.error.issues.map(i => `${i.path.join(".")}: ${i.message}`).join("; ")}`);
+    }
+    const mentions = new Map<string, ProactiveMention>();
+    for (const [rawMentionAlias, rawMention] of Object.entries(destination.data.mentions ?? {})) {
+      const mentionAlias = normalizeDestinationAlias(rawMentionAlias);
+      if (mentionAlias === null) {
+        throw new Error(`${name} destination "${alias}" contains an invalid mention alias: ${JSON.stringify(rawMentionAlias)}`);
+      }
+      if (mentions.has(mentionAlias)) {
+        throw new Error(`${name} destination "${alias}" contains a duplicate mention alias after normalization: ${mentionAlias}`);
+      }
+      mentions.set(mentionAlias, rawMention);
+    }
+    registry.set(alias, { alias, guildId: destination.data.guildId, channelId: destination.data.channelId, mentions });
+  }
+  return registry;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig {
   const discordToken = env.DISCORD_TOKEN?.trim();
   if (!discordToken) throw new Error("DISCORD_TOKEN is required");
@@ -183,6 +288,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig 
   const channels = parseSnowflakeList("DISCORD_ALLOWED_CHANNEL_IDS", env.DISCORD_ALLOWED_CHANNEL_IDS, file.policy?.allowedChannelIds ?? []);
   const dms = parseSnowflakeList("DISCORD_ALLOWED_DM_USER_IDS", env.DISCORD_ALLOWED_DM_USER_IDS, file.policy?.allowedDmUserIds ?? []);
   const mentions = parseSnowflakeList("DISCORD_ALLOWED_MENTION_USER_IDS", env.DISCORD_ALLOWED_MENTION_USER_IDS, file.policy?.allowedMentionUserIds ?? []);
+  const mentionRoles = parseSnowflakeList("DISCORD_ALLOWED_MENTION_ROLE_IDS", env.DISCORD_ALLOWED_MENTION_ROLE_IDS, file.policy?.allowedMentionRoleIds ?? []);
   if (transport === "http" && guilds.length === 0 && channels.length === 0 && dms.length === 0) {
     throw new Error("HTTP mode requires an explicit policy allowlist in config.json");
   }
@@ -216,7 +322,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig 
     dmUserIds: bridgeDmUserIds,
     channelIds: bridgeChannelIds,
     roleIds: bridgeRoleIds,
+    botCooldownMs: parseInteger(
+      "DISCORD_BRIDGE_BOT_COOLDOWN_MS",
+      env.DISCORD_BRIDGE_BOT_COOLDOWN_MS,
+      30000,
+      1000,
+      60 * 60 * 1000,
+    ),
     allowEveryone: bridgeAllowEveryone,
+    proactiveDestinations: parseProactiveDestinations("DISCORD_BRIDGE_PROACTIVE_DESTINATIONS_JSON", env.DISCORD_BRIDGE_PROACTIVE_DESTINATIONS_JSON),
     queueLimit: parseInteger("DISCORD_BRIDGE_QUEUE_LIMIT", env.DISCORD_BRIDGE_QUEUE_LIMIT, 256, 1, 10000),
     pollTimeoutMs: parseInteger("DISCORD_BRIDGE_POLL_TIMEOUT_MS", env.DISCORD_BRIDGE_POLL_TIMEOUT_MS, 20000, 0, 120000),
     jsonLimitBytes: parseInteger("DISCORD_BRIDGE_JSON_LIMIT_BYTES", env.DISCORD_BRIDGE_JSON_LIMIT_BYTES, 64 * 1024, 1024, 1024 * 1024),
@@ -233,6 +347,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig 
       allowedChannelIds: channels,
       allowedDmUserIds: dms,
       allowedMentionUserIds: mentions,
+      allowedMentionRoleIds: mentionRoles,
       allowLocalFiles,
       allowedLocalRoots: roots,
       remoteMode: transport === "http",

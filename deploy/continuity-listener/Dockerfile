@@ -16,6 +16,8 @@ WORKDIR /app
 
 COPY entrypoint.mjs /app/entrypoint.mjs
 COPY channel-reply-route-guard.ts /app/channel-reply-route-guard.ts
+COPY proactive-discord.ts /app/proactive-discord.ts
+COPY proactive-telegram.ts /app/proactive-telegram.ts
 COPY continuity-discord/plugin.mjs /app/continuity-discord/plugin.mjs
 
 ENV NODE_ENV=production \
