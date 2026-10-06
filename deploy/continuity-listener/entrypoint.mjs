@@ -99,7 +99,9 @@ const now = new Date().toISOString();
 
 const lettaRoot = path.join(home, ".letta");
 const telegramDir = path.join(lettaRoot, "channels", "telegram");
-const discordChannelId = "continuity-discord";
+// Preserve the production channel identity. Installing under a second ID would
+// make Letta load two adapters that poll the same bridge.
+const discordChannelId = "cass-discord";
 const discordDir = path.join(lettaRoot, "channels", discordChannelId);
 const modsDir = path.join(lettaRoot, "mods");
 const discordPluginAsset = testHome && process.env.CONTINUITY_TEST_PLUGIN_PATH?.trim()
@@ -108,8 +110,18 @@ const discordPluginAsset = testHome && process.env.CONTINUITY_TEST_PLUGIN_PATH?.
 const routeGuardAsset = testHome && process.env.CONTINUITY_TEST_GUARD_PATH?.trim()
   ? process.env.CONTINUITY_TEST_GUARD_PATH.trim()
   : "/app/channel-reply-route-guard.ts";
+const proactiveDiscordAsset = testHome && process.env.CONTINUITY_TEST_PROACTIVE_PATH?.trim()
+  ? process.env.CONTINUITY_TEST_PROACTIVE_PATH.trim()
+  : "/app/proactive-discord.ts";
+const proactiveTelegramAsset = testHome && process.env.CONTINUITY_TEST_PROACTIVE_TELEGRAM_PATH?.trim()
+  ? process.env.CONTINUITY_TEST_PROACTIVE_TELEGRAM_PATH.trim()
+  : "/app/proactive-telegram.ts";
 
-const currentUid = typeof process.getuid === "function" ? process.getuid() : 0;
+const currentUid = typeof process.getuid === "function" ? process.getuid() : null;
+
+function hasUnsafePosixOwnershipOrMode(metadata) {
+  return currentUid !== null && (metadata.uid !== currentUid || (metadata.mode & 0o022) !== 0);
+}
 
 async function ensureSafeDirectory(directory) {
   let metadata;
@@ -123,7 +135,7 @@ async function ensureSafeDirectory(directory) {
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
     throw new Error(`State path ${directory} must be a real directory`);
   }
-  if (metadata.uid !== currentUid || (metadata.mode & 0o022) !== 0) {
+  if (hasUnsafePosixOwnershipOrMode(metadata)) {
     throw new Error(`State directory ${directory} has unsafe ownership or permissions`);
   }
 }
@@ -143,7 +155,7 @@ async function readJson(paths, fallback) {
   for (const file of paths) {
     try {
       const metadata = await lstat(file);
-      if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.uid !== currentUid || (metadata.mode & 0o022) !== 0) {
+      if (!metadata.isFile() || metadata.isSymbolicLink() || hasUnsafePosixOwnershipOrMode(metadata)) {
         throw new Error(`State file ${path.basename(file)} has unsafe ownership, permissions, or type`);
       }
       return JSON.parse(await readFile(file, "utf8"));
@@ -154,11 +166,24 @@ async function readJson(paths, fallback) {
   return structuredClone(fallback);
 }
 
+async function safeStateFileExists(file) {
+  try {
+    const metadata = await lstat(file);
+    if (!metadata.isFile() || metadata.isSymbolicLink() || hasUnsafePosixOwnershipOrMode(metadata)) {
+      throw new Error(`State file ${path.basename(file)} has unsafe ownership, permissions, or type`);
+    }
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 async function writeAtomic(file, data, mode = 0o600) {
   const validateDestination = async () => {
     try {
       const metadata = await lstat(file);
-      if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.uid !== currentUid || (metadata.mode & 0o022) !== 0) {
+      if (!metadata.isFile() || metadata.isSymbolicLink() || hasUnsafePosixOwnershipOrMode(metadata)) {
         throw new Error(`State destination ${file} is not a safe owned regular file`);
       }
     } catch (error) {
@@ -177,8 +202,13 @@ async function writeAtomic(file, data, mode = 0o600) {
     await validateDestination();
     await rename(temporary, file);
     await chmod(file, mode);
-    const directory = await open(path.dirname(file), "r");
-    try { await directory.sync(); } finally { await directory.close(); }
+    // Directory fsync is required for durable rename semantics on Linux, the
+    // deployment platform. Windows rejects fsync on directory handles, so the
+    // local seed/test path cannot perform that POSIX durability step.
+    if (process.platform !== "win32") {
+      const directory = await open(path.dirname(file), "r");
+      try { await directory.sync(); } finally { await directory.close(); }
+    }
   } finally {
     if (handle) await handle.close().catch(() => {});
     await rm(temporary, { force: true }).catch(() => {});
@@ -206,6 +236,8 @@ await writeJsonAtomic(path.join(discordDir, "channel.json"), {
   runtimeModules: [],
 });
 await installFile(routeGuardAsset, path.join(modsDir, "channel-reply-route-guard.ts"), 0o600);
+await installFile(proactiveDiscordAsset, path.join(modsDir, "proactive-discord.ts"), 0o600);
+await installFile(proactiveTelegramAsset, path.join(modsDir, "proactive-telegram.ts"), 0o600);
 
 const telegramAccountsPath = path.join(telegramDir, "accounts.json");
 const telegramAccounts = await readJson([telegramAccountsPath], { accounts: [] });
@@ -311,6 +343,7 @@ Object.assign(discordAccount, {
     request_timeout_ms: 30000,
     min_backoff_ms: 500,
     max_backoff_ms: 10000,
+    pending_poll_delay_ms: 2000,
   },
   updatedAt: now,
 });
@@ -318,7 +351,14 @@ await writeJsonAtomic(discordAccountsPath, discordAccounts);
 
 const discordRoutingYaml = path.join(discordDir, "routing.yaml");
 const discordRoutingJson = path.join(discordDir, "routing.json");
-const discordRouting = await readJson([discordRoutingJson, discordRoutingYaml], { routes: [] });
+const discordRoutingYamlExists = await safeStateFileExists(discordRoutingYaml);
+const discordRoutingJsonExists = await safeStateFileExists(discordRoutingJson);
+// Letta's runtime registry is routing.yaml. Preserve a legacy JSON-only
+// installation, but whenever YAML exists it is the sole source of truth.
+const discordRoutingPath = discordRoutingYamlExists
+  ? discordRoutingYaml
+  : (discordRoutingJsonExists ? discordRoutingJson : discordRoutingYaml);
+const discordRouting = await readJson([discordRoutingPath], { routes: [] });
 if (!discordRouting || typeof discordRouting !== "object" || !Array.isArray(discordRouting.routes)) {
   throw new Error("Discord routing state has an invalid schema");
 }
@@ -363,7 +403,12 @@ for (const channelId of discordChannelIds) {
     updatedAt: now,
   });
 }
-await writeJsonAtomic(discordRoutingJson, discordRouting);
+await writeJsonAtomic(discordRoutingPath, discordRouting);
+// If migration left both names behind, keep the fallback byte-for-byte aligned
+// so no older adapter can observe a contradictory route registry.
+if (discordRoutingYamlExists && discordRoutingJsonExists) {
+  await writeJsonAtomic(discordRoutingJson, discordRouting);
+}
 await writeJsonAtomic(managedRoutesPath, { channelIds: discordChannelIds, updatedAt: now });
 
 console.log(

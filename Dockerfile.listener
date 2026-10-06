@@ -14,11 +14,15 @@ RUN npm install --global @letta-ai/letta-code@0.32.12
 
 WORKDIR /app
 
-COPY entrypoint.mjs /app/entrypoint.mjs
-COPY channel-reply-route-guard.ts /app/channel-reply-route-guard.ts
-COPY proactive-discord.ts /app/proactive-discord.ts
-COPY proactive-telegram.ts /app/proactive-telegram.ts
-COPY continuity-discord/plugin.mjs /app/continuity-discord/plugin.mjs
+# Production's listener service is connected to the repository root so both
+# bridge and listener deployments carry one auditable Git revision. Keep these
+# paths root-relative; the template-specific Dockerfile remains usable from
+# deploy/continuity-listener as its isolated service root.
+COPY deploy/continuity-listener/entrypoint.mjs /app/entrypoint.mjs
+COPY deploy/continuity-listener/channel-reply-route-guard.ts /app/channel-reply-route-guard.ts
+COPY deploy/continuity-listener/proactive-discord.ts /app/proactive-discord.ts
+COPY deploy/continuity-listener/proactive-telegram.ts /app/proactive-telegram.ts
+COPY deploy/continuity-listener/continuity-discord/plugin.mjs /app/continuity-discord/plugin.mjs
 
 ENV NODE_ENV=production \
     LETTA_BASE_URL=https://api.letta.com \

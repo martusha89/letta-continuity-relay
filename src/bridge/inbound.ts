@@ -87,6 +87,7 @@ export function toInboundMessage(
     parentChannelId: view.parentChannelId,
     authorId: view.author?.id ?? "unknown",
     authorName: view.author?.username ?? "unknown",
+    authorIsBot: view.author?.bot === true,
     text,
     attachments,
     isMention: botMentioned || allowedRoleIds.length > 0 || everyoneMentioned,
@@ -97,7 +98,7 @@ export function toInboundMessage(
  * Pure gate for an inbound Discord message.
  *
  * Order matters and is fail-closed:
- *  1. author sanity (bot/webhook/system are never delivered),
+ *  1. author sanity (webhook/system/self-bot are never delivered),
  *  2. policy allowlists (guild + channel; DMs require the separate bridge
  *     DM allowlist regardless of the general DM policy),
  *  3. addressed-to-bot (mention or reply-to-bot) — no firehose.
@@ -108,12 +109,16 @@ export function gateInbound(
   bridge: Pick<BridgeConfig, "dmUserIds" | "channelIds" | "roleIds" | "allowEveryone">,
   botUserId: string,
 ): GateResult {
-  if (view.author?.bot) return ignore("bot_author");
   if (view.webhookId !== null) return ignore("webhook_author");
   if (view.system || view.author?.system) return ignore("system_author");
   if (!view.author) return ignore("system_author");
+  const authorIsBot = view.author.bot === true;
+  if (authorIsBot && view.author.id === botUserId) return ignore("bot_author");
 
   if (view.isDM) {
+    // Companion bots are never admitted through DMs, even if a human with the
+    // same ID would be present in the separate DM allowlist.
+    if (authorIsBot) return ignore("bot_author");
     const dmUserId = view.dmUserId ?? view.author.id;
     // Bridge DMs are deny-by-default and use their OWN allowlist, distinct
     // from the outbound DM policy.
@@ -142,6 +147,16 @@ export function gateInbound(
         return ignore("channel_not_allowed");
       }
     }
+  }
+
+  if (authorIsBot) {
+    // Bots get exactly one addressing mechanism. Replies, role mentions,
+    // @everyone/@here, and ambient chatter never wake the relay.
+    if (!view.mentionsUserIds.includes(botUserId)) return ignore("bot_direct_mention_required");
+    return {
+      verdict: "deliver",
+      message: toInboundMessage(view, botUserId),
+    };
   }
 
   const addressedToBot =

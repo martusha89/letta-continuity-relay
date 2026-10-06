@@ -5,6 +5,27 @@ import { BoundedIdempotencySet, BridgeEventQueue } from "./queue.js";
 import type { IgnoreReason } from "./types.js";
 
 const IDEMPOTENCY_CAPACITY = 4096;
+const BOT_COOLDOWN_CAPACITY = 4096;
+
+class BoundedBotCooldowns {
+  private readonly acceptedAt = new Map<string, number>();
+  constructor(private readonly capacity: number, private readonly cooldownMs: number) {}
+
+  permits(key: string, now = Date.now()): boolean {
+    const previous = this.acceptedAt.get(key);
+    return previous === undefined || now - previous >= this.cooldownMs;
+  }
+
+  record(key: string, now = Date.now()): void {
+    this.acceptedAt.delete(key);
+    this.acceptedAt.set(key, now);
+    while (this.acceptedAt.size > this.capacity) {
+      const oldest = this.acceptedAt.keys().next().value;
+      if (typeof oldest !== "string") break;
+      this.acceptedAt.delete(oldest);
+    }
+  }
+}
 
 /** Extract the pure structural view from a discord.js Message. */
 export function toMessageView(message: Message): InboundMessageView {
@@ -59,6 +80,7 @@ export function createInboundPipeline(options: {
   const log = options.log ?? (() => {});
   const queue = new BridgeEventQueue(bridge.queueLimit);
   const seen = new BoundedIdempotencySet(IDEMPOTENCY_CAPACITY);
+  const botCooldowns = new BoundedBotCooldowns(BOT_COOLDOWN_CAPACITY, bridge.botCooldownMs);
 
   async function handle(message: Message): Promise<void> {
     const view = toMessageView(message);
@@ -85,11 +107,19 @@ export function createInboundPipeline(options: {
       log("[bridge] inbound ignored: duplicate");
       return;
     }
+    const cooldownKey = gated.message.authorIsBot
+      ? `${gated.message.authorId}:${gated.message.channel}`
+      : null;
+    if (cooldownKey && !botCooldowns.permits(cooldownKey)) {
+      log("[bridge] inbound ignored: bot_cooldown");
+      return;
+    }
     const event = queue.enqueue(gated.message);
     if (!event) {
       log(`[bridge] inbound dropped: ${"queue_full" satisfies IgnoreReason}`);
       return;
     }
+    if (cooldownKey) botCooldowns.record(cooldownKey);
     log(`[bridge] inbound queued seq=${event.seq} channel=${gated.message.channelId}`);
   }
 

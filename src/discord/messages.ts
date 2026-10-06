@@ -1,6 +1,6 @@
-import { type Message, type MessageCreateOptions } from "discord.js";
+import { type Message, type MessageCreateOptions, type MessageMentionOptions } from "discord.js";
 import { findChannel, getClient, getPolicy, type SendableChannel } from "./client.js";
-import { assertDmAllowed, assertMentionUsersAllowed } from "./policy.js";
+import { assertDmAllowed, assertMentionRolesAllowed, assertMentionUsersAllowed } from "./policy.js";
 import type { LimitsConfig } from "../config.js";
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -13,12 +13,32 @@ async function typingBeat(channel: SendableChannel, content: string | undefined,
   const scaled = Math.round((content?.length ?? 0) * 33);
   await sleep(Math.min(limits.typingDelayMaxMs, Math.max(limits.typingDelayMinMs, scaled)));
 }
-export interface SendOpts { server?: string; channel: string; content?: string; replyToMessageId?: string; mentionUserIds?: string[]; fallbackGuildId?: string; limits: LimitsConfig; }
+export interface SendOpts { server?: string; channel: string; content?: string; replyToMessageId?: string; mentionUserIds?: string[]; mentionRoleIds?: string[]; fallbackGuildId?: string; limits: LimitsConfig; }
+export function buildMessagePayload(
+  content: string | undefined,
+  mentionUserIds: string[],
+  mentionRoleIds: string[],
+  extra?: MessageCreateOptions,
+): MessageCreateOptions {
+  const allowedMentions: MessageMentionOptions = {
+    parse: [],
+    users: mentionUserIds,
+    roles: mentionRoleIds,
+    repliedUser: false,
+  };
+  return { content, ...(extra ?? {}), allowedMentions };
+}
+
 export async function sendMessage(opts: SendOpts & { extra?: MessageCreateOptions }) {
   checkText(opts.content, opts.limits.messageChars);
   const channel = await findChannel(opts.channel, opts.server, opts.fallbackGuildId);
-  const mentionUserIds = assertMentionUsersAllowed(getPolicy(), opts.mentionUserIds ?? []);
-  const payload: MessageCreateOptions = { content: opts.content, allowedMentions: { parse: [], users: mentionUserIds, repliedUser: false }, ...(opts.extra ?? {}) };
+  const policy = getPolicy();
+  const mentionUserIds = assertMentionUsersAllowed(policy, opts.mentionUserIds ?? []);
+  const mentionRoleIds = assertMentionRolesAllowed(policy, opts.mentionRoleIds ?? []);
+  // The validated allowedMentions are assigned LAST: `extra` (embeds, files,
+  // stickers, components) can never override the suppression of @everyone/@here
+  // parsing, the allowlisted pings, or repliedUser:false.
+  const payload = buildMessagePayload(opts.content, mentionUserIds, mentionRoleIds, opts.extra);
   if (opts.replyToMessageId) payload.reply = { messageReference: opts.replyToMessageId, failIfNotExists: true };
   await typingBeat(channel, opts.content, opts.limits);
   const sent = await channel.send(payload);
@@ -53,8 +73,10 @@ export async function reactToMessage(opts: { server?: string; channel: string; m
 export async function setTyping(opts: { server?: string; channel: string; fallbackGuildId?: string }) {
   const channel = await findChannel(opts.channel, opts.server, opts.fallbackGuildId); if ("sendTyping" in channel) await channel.sendTyping(); return { ok: true };
 }
-export async function sendDirectMessage(opts: { userId: string; content: string; limits: LimitsConfig }) {
+export async function sendDirectMessage(opts: { userId: string; content: string; replyToMessageId?: string; limits: LimitsConfig }) {
   checkText(opts.content, opts.limits.messageChars); assertDmAllowed(getPolicy(), opts.userId);
   const user = await getClient().users.fetch(opts.userId); const dm = await user.createDM(); await typingBeat(dm, opts.content, opts.limits);
-  const sent = await dm.send({ content: opts.content, allowedMentions: { parse: [] } }); return { id: sent.id, channelId: dm.id, recipient: user.tag };
+  const payload: MessageCreateOptions = { content: opts.content, allowedMentions: { parse: [], repliedUser: false } };
+  if (opts.replyToMessageId) payload.reply = { messageReference: opts.replyToMessageId, failIfNotExists: true };
+  const sent = await dm.send(payload); return { id: sent.id, channelId: dm.id, recipient: user.tag };
 }
