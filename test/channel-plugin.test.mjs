@@ -35,6 +35,10 @@ function account(overrides = {}) {
       min_backoff_ms: 100,
       max_backoff_ms: 500,
       pending_poll_delay_ms: 10,
+      // Most adapter unit tests exercise transport concurrency independently
+      // of Letta's turn lifecycle. Production enables serialization explicitly;
+      // the dedicated lifecycle regression below does the same.
+      serialize_turns: false,
       ...overrides,
     },
   };
@@ -131,16 +135,20 @@ async function withMockFetch(mock, fn) {
 test("custom channel metadata and account config are fail-closed and secret-safe", () => {
   assert.equal(channelPlugin.metadata.id, "continuity-discord");
   assert.deepEqual(channelPlugin.messageActions.describeMessageTool(), { actions: ["send", "react"] });
-  const parsed = parseAccountConfig(account());
+  const parsed = parseAccountConfig(account({ serialize_turns: undefined }));
   assert.equal(parsed.baseUrl, "https://bridge.example.test");
   assert.equal(parsed.bearerToken.length, 32);
   assert.equal(parsed.deliveryConcurrency, 4);
   assert.equal(parsed.deliveryQuarantineLimit, 4);
   assert.equal(parsed.deliveryMaxUnresolved, 8);
   assert.equal(parsed.deliveryTimeoutMs, 30000);
+  assert.equal(parsed.serializeTurns, true);
+  assert.equal(parsed.turnLifecycleTimeoutMs, 1200000);
   assert.equal(JSON.stringify(parsed).includes("Bearer"), false);
   assert.throws(() => parseAccountConfig(account({ base_url: "http://public.example.test" })), /HTTPS/);
   assert.doesNotThrow(() => parseAccountConfig(account({ base_url: "http://continuity-discord-bridge.railway.internal:8080" })));
+  assert.throws(() => parseAccountConfig(account({ serialize_turns: "yes" })), /serialize_turns is invalid/);
+  assert.throws(() => parseAccountConfig(account({ turn_lifecycle_timeout_ms: 99 })), /turn_lifecycle_timeout_ms is invalid/);
   assert.throws(() => parseAccountConfig(account({ base_url: "https://u:p@example.test" })), /credentials/);
   assert.throws(() => parseAccountConfig(account({ auth: "short" })), /32 characters/);
 });
@@ -265,7 +273,10 @@ test("Discord DM typing targets the real DM channel rather than the user ID", as
   };
   typing.start(source);
   await new Promise(resolve => setTimeout(resolve, 2));
-  assert.deepEqual(beats, [DM_CHANNEL]);
+  // Under a loaded parallel suite the 10ms refresh timer may fire before this
+  // 2ms assertion callback. Every beat must still target the DM channel.
+  assert.ok(beats.length >= 1);
+  assert.ok(beats.every(target => target === DM_CHANNEL));
   assert.equal(typing.isActive(DM_CHANNEL), true);
   assert.equal(typing.isActive(USER), false);
   typing.stop(source);
@@ -375,23 +386,32 @@ test("an old lock owned by a live process is never reclaimed as stale", async ()
   assert.equal(owner.token, "live-owner-token-1234567890");
 });
 
-test("adapter typing follows queued, processing, and finished lifecycle per current-run source", async () => {
+test("adapter serializes turns through terminal lifecycle and bounds a missing terminal callback", async () => {
   const typingBodies = [];
-  const queuedEvents = [event(), event(2, { messageId: "555555555555555555" })];
+  const logs = [];
+  const queuedEvents = [
+    event(),
+    event(2, { messageId: "555555555555555555" }),
+    event(3, { messageId: "555555555555555556" }),
+  ];
   const delivered = [];
-  let bothDelivered;
-  const accepted = new Promise(resolve => { bothDelivered = resolve; });
+  let firstDelivered;
+  let secondDelivered;
+  let thirdDelivered;
+  const firstAccepted = new Promise(resolve => { firstDelivered = resolve; });
+  const secondAccepted = new Promise(resolve => { secondDelivered = resolve; });
+  const thirdAccepted = new Promise(resolve => { thirdDelivered = resolve; });
   await withMockFetch(async (url, options = {}) => {
     const path = new URL(url).pathname;
     if (path.endsWith("/bridge/events")) {
       if (queuedEvents.length === 0) return abortablePending(options.signal);
-      return json({ events: [...queuedEvents], lastSeq: 2, dropped: 0, reset: false });
+      return json({ events: [...queuedEvents], lastSeq: 3, dropped: 0, reset: false });
     }
     if (path.endsWith("/bridge/ack")) {
       const body = JSON.parse(options.body);
       const index = queuedEvents.findIndex(item => item.seq === body.seq && item.message.messageId === body.messageId);
       if (index !== -1) queuedEvents.splice(index, 1);
-      return json({ acked: body.seq, messageId: body.messageId, exact: true, removed: index === -1 ? 0 : 1, lastSeq: 2, size: queuedEvents.length });
+      return json({ acked: body.seq, messageId: body.messageId, exact: true, removed: index === -1 ? 0 : 1, lastSeq: 3, size: queuedEvents.length });
     }
     if (path.endsWith("/bridge/send")) {
       typingBodies.push(JSON.parse(options.body));
@@ -399,22 +419,37 @@ test("adapter typing follows queued, processing, and finished lifecycle per curr
     }
     throw new Error("unexpected request");
   }, async () => {
-    const adapter = isolatedAdapter(account({ typing_refresh_ms: 5, typing_max_duration_ms: 100 }));
+    const adapter = isolatedAdapter(account({
+      serialize_turns: true,
+      turn_lifecycle_timeout_ms: 100,
+      typing_refresh_ms: 5,
+      typing_max_duration_ms: 500,
+    }));
     adapter.onMessage = async message => {
       delivered.push(message);
-      if (delivered.length === 2) bothDelivered();
+      if (delivered.length === 1) firstDelivered();
+      if (delivered.length === 2) secondDelivered();
+      if (delivered.length === 3) thirdDelivered();
     };
-    await adapter.start();
+    await adapter.start({ logger: line => logs.push(line) });
     try {
-      await accepted;
-      const [first, second] = delivered;
+      await firstAccepted;
+      const [first] = delivered;
       await adapter.handleTurnLifecycleEvent({ type: "queued", source: first });
       await adapter.handleTurnLifecycleEvent({ type: "processing", sources: [first] });
-      await adapter.handleTurnLifecycleEvent({ type: "queued", source: second });
+      await new Promise(resolve => setTimeout(resolve, 25));
+      assert.equal(delivered.length, 1, "the next source must remain queued while the first turn is active");
       await adapter.handleTurnLifecycleEvent({ type: "finished", sources: [first], outcome: "completed" });
+      await secondAccepted;
+      const second = delivered[1];
+      await adapter.handleTurnLifecycleEvent({ type: "queued", source: second });
       await new Promise(resolve => setTimeout(resolve, 14));
-      assert.ok(typingBodies.length >= 2, "second queued source should keep the shared target refreshing");
-      await adapter.handleTurnLifecycleEvent({ type: "finished", sources: [second], outcome: "completed" });
+      assert.ok(typingBodies.length >= 2, "the second source should begin typing only after the first finishes");
+      await thirdAccepted;
+      assert.equal(delivered.length, 3, "a missing terminal callback must not deadlock Discord ingress forever");
+      assert.ok(logs.some(line => line.includes("without a terminal lifecycle event")));
+      const third = delivered[2];
+      await adapter.handleTurnLifecycleEvent({ type: "finished", sources: [third], outcome: "completed" });
       const stoppedAt = typingBodies.length;
       await new Promise(resolve => setTimeout(resolve, 12));
       assert.equal(typingBodies.length, stoppedAt);
@@ -498,6 +533,7 @@ test("timed-out deliveries preserve progress but keep total unresolved work boun
     throw new Error("unexpected request");
   }, async () => {
     const adapter = isolatedAdapter(account({
+      serialize_turns: false,
       delivery_concurrency: 2,
       delivery_quarantine_limit: 1,
       delivery_timeout_ms: 100,
@@ -555,6 +591,7 @@ test("a quarantined delivery can finish later and acknowledge exactly once", asy
     throw new Error("unexpected request");
   }, async () => {
     const adapter = isolatedAdapter(account({
+      serialize_turns: false,
       delivery_concurrency: 2,
       delivery_quarantine_limit: 1,
       delivery_timeout_ms: 100,
