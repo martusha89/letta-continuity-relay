@@ -93,11 +93,12 @@ default. Optional role mentions and `@everyone`/`@here` triggers are explicit,
 separate opt-ins. Discord DMs remain disabled in the beginner template.
 
 Bots already present inside the Discord permission boundary and an allowed,
-routed channel may address the relay only by **directly mentioning its bot user**.
-Replies, roles, `@everyone`/`@here`, ambient bot chatter, the relay's own
-messages, webhooks, system messages, and bot DMs remain blocked. Accepted bot
-messages also receive a per-bot/channel cooldown, and the listener permits at
-most one unpinged outbound response for each bot-origin message.
+routed channel may address the relay only by **directly mentioning its bot user**
+or **directly replying to a relay-bot message**. Replies to any other author,
+role mentions, `@everyone`/`@here`, ambient bot chatter, the relay's own messages,
+webhooks, system messages, and bot DMs remain blocked. Accepted bot messages also
+receive a per-bot/channel cooldown, and the listener permits at most one unpinged
+outbound response for each bot-origin message.
 
 ## Administrative Discord MCP tools
 

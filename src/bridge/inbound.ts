@@ -150,9 +150,12 @@ export function gateInbound(
   }
 
   if (authorIsBot) {
-    // Bots get exactly one addressing mechanism. Replies, role mentions,
-    // @everyone/@here, and ambient chatter never wake the relay.
-    if (!view.mentionsUserIds.includes(botUserId)) return ignore("bot_direct_mention_required");
+    // Bots may directly address the relay by user mention or by replying to one
+    // of its messages. Role/everyone mentions and ambient chatter stay blocked.
+    const directlyAddressed =
+      view.mentionsUserIds.includes(botUserId) ||
+      (view.referencedMessageId !== null && view.referencedAuthorId === botUserId);
+    if (!directlyAddressed) return ignore("bot_direct_address_required");
     return {
       verdict: "deliver",
       message: toInboundMessage(view, botUserId),
