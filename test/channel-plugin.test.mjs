@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { copyFile, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { mkdtempSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -13,6 +13,7 @@ import {
   createDiscordTypingController,
   ensureThreadRoute,
   mapBridgeEvent,
+  materializeBridgeAttachments,
   parseAccountConfig,
 } from "../deploy/continuity-listener/continuity-discord/plugin.mjs";
 
@@ -208,6 +209,138 @@ test("bridge events map to source-labelled Letta messages without remote attachm
   assert.equal(JSON.stringify(inbound).includes("cdn.example.test"), false);
   assert.equal(inbound.raw.bridgeSeq, 7);
   assert.equal(inbound.raw.discord.authorIsBot, false);
+});
+
+test("trusted Discord images are materialized as bounded native channel attachments", async t => {
+  const directory = await mkdtemp(join(tmpdir(), "continuity-discord-attachment-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const sentinel = join(directory, "owned-by-another-session");
+  await writeFile(sentinel, "do not remove");
+  const bytes = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from("fake-png-bytes")]);
+  const calls = [];
+  const attachments = await materializeBridgeAttachments([{
+    id: "a1",
+    name: "cat.png",
+    contentType: "image/png",
+    size: bytes.length,
+    url: "https://cdn.example.test/attachments/1/2/cat.png?ex=trusted",
+  }], {
+    baseDir: directory,
+    allowedHosts: new Set(["cdn.example.test"]),
+    sourceMessageId: MESSAGE,
+    sourceThreadId: "666666666666666666",
+    fetchImpl: async (url, init) => {
+      calls.push({ url: url.toString(), redirect: init.redirect });
+      return new Response(bytes, { status: 200, headers: {
+        "content-length": String(bytes.length),
+        "content-type": "image/png",
+      } });
+    },
+  });
+
+  assert.deepEqual(calls, [{
+    url: "https://cdn.example.test/attachments/1/2/cat.png?ex=trusted",
+    redirect: "manual",
+  }]);
+  assert.equal(attachments.length, 1);
+  assert.equal(attachments[0].kind, "image");
+  assert.equal(attachments[0].mimeType, "image/png");
+  assert.equal(attachments[0].sourceMessageId, MESSAGE);
+  assert.equal(attachments[0].sourceThreadId, "666666666666666666");
+  assert.equal(attachments[0].imageDataBase64, bytes.toString("base64"));
+  assert.deepEqual(await readFile(attachments[0].localPath), bytes);
+  assert.equal(await readFile(sentinel, "utf8"), "do not remove");
+  assert.equal(JSON.stringify(attachments).includes("cdn.example.test"), false);
+});
+
+test("attachment materialization rejects non-Discord URLs and enforces total bytes", async t => {
+  const directory = await mkdtemp(join(tmpdir(), "continuity-discord-attachment-limits-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  let fetches = 0;
+  const attachments = await materializeBridgeAttachments([
+    { id: "a1", name: "wrong.png", contentType: "image/png", size: 1, url: "https://example.test/attachments/1/2/wrong.png" },
+    { id: "a2", name: "large.png", contentType: "image/png", size: 11, url: "https://cdn.discordapp.com/attachments/1/2/large.png" },
+  ], {
+    baseDir: directory,
+    maxItemBytes: 10,
+    maxTotalBytes: 10,
+    fetchImpl: async () => { fetches += 1; return new Response("x"); },
+  });
+
+  assert.equal(fetches, 0);
+  assert.equal(attachments[0].downloadReason, "missing_download_url");
+  assert.equal(attachments[1].downloadReason, "exceeds_auto_download_limit");
+});
+
+test("attachment materialization rejects spoofed images and does not follow redirects", async t => {
+  const directory = await mkdtemp(join(tmpdir(), "continuity-discord-attachment-spoof-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const requests = [];
+  const attachments = await materializeBridgeAttachments([
+    { id: "a1", name: "spoof.png", contentType: "image/png", size: 13, url: "https://cdn.discordapp.com/attachments/1/2/spoof.png" },
+    { id: "a2", name: "redirect.png", contentType: "image/png", size: 13, url: "https://cdn.discordapp.com/attachments/1/2/redirect.png" },
+  ], {
+    baseDir: directory,
+    fetchImpl: async (url, init) => {
+      requests.push({ url: url.toString(), redirect: init.redirect });
+      if (url.pathname.endsWith("redirect.png")) {
+        return new Response(null, { status: 302, headers: { location: "https://example.test/payload" } });
+      }
+      return new Response("<html>nope", { status: 200, headers: { "content-type": "text/html" } });
+    },
+  });
+
+  assert.equal(requests.length, 2);
+  assert.equal(requests.every(request => request.redirect === "manual"), true);
+  assert.equal(attachments[0].kind, "file");
+  assert.equal(attachments[0].mimeType, "application/octet-stream");
+  assert.equal(attachments[0].imageDataBase64, undefined);
+  assert.equal(attachments[0].sizeBytes, Buffer.byteLength("<html>nope"));
+  assert.equal(attachments[0].downloadReason, "unsupported_attachment_type");
+  assert.equal(attachments[0].localPath, undefined);
+  assert.equal(attachments[1].downloadReason, "download_failed");
+  assert.equal(attachments[1].localPath, undefined);
+  assert.deepEqual(await readdir(directory), []);
+});
+
+test("attachment materialization removes chunked bodies that exceed the hard limit", async t => {
+  const directory = await mkdtemp(join(tmpdir(), "continuity-discord-attachment-stream-limit-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  let fetchCount = 0;
+  const attachments = await materializeBridgeAttachments([
+    {
+      id: "a1",
+      name: "too-large.bin",
+      contentType: "application/octet-stream",
+      url: "https://cdn.discordapp.com/attachments/1/2/too-large.bin",
+    },
+    {
+      id: "a2",
+      name: "must-not-download.bin",
+      contentType: "application/octet-stream",
+      size: 1,
+      url: "https://cdn.discordapp.com/attachments/1/2/must-not-download.bin",
+    },
+  ], {
+    baseDir: directory,
+    maxItemBytes: 5,
+    maxTotalBytes: 5,
+    fetchImpl: async () => {
+      fetchCount += 1;
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new Uint8Array([1, 2, 3]));
+          controller.enqueue(new Uint8Array([4, 5, 6]));
+          controller.close();
+        },
+      }), { status: 200 });
+    },
+  });
+
+  assert.equal(attachments[0].downloadReason, "exceeds_auto_download_limit");
+  assert.equal(attachments[1].downloadReason, "exceeds_auto_download_limit");
+  assert.equal(fetchCount, 1);
+  assert.deepEqual(await readdir(directory), []);
 });
 
 test("Discord typing leases preserve queued turns sharing one channel", async () => {

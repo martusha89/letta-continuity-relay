@@ -16,9 +16,9 @@ network with an independently generated bridge credential.
 
 This is advanced community infrastructure, not an official Letta Cloud
 Telegram/Discord integration. Letta's public custom-channel documentation
-currently describes CLI channels as a local-backend feature. The template pins
-the tested Letta Code version and requires end-to-end verification after every
-upgrade.
+currently describes CLI channels as a local-backend feature. The template uses
+a checksummed custom Letta Code 0.34.24 package with the production approval
+recovery repair and requires end-to-end verification after every upgrade.
 
 ## Common use cases
 
@@ -26,8 +26,8 @@ upgrade.
   Discord.
 - Give an AI companion a bounded Discord presence without creating a second
   public-facing agent.
-- Keep Discord ingress limited to explicit mentions, replies, and optional
-  allowlisted role/`@everyone` triggers.
+- Keep Discord ingress limited to explicit mentions, direct replies to the
+  relay, and optional allowlisted role/`@everyone` triggers.
 - Preserve cross-channel context while preventing stale-route reply leaks.
 - Let the agent deliberately initiate Discord outreach through verified named
   destinations without exposing raw Discord IDs to the agent.
@@ -48,7 +48,13 @@ upgrade.
 Run one replica of each service. Do not reuse either bot token in another
 gateway or poller. Discord event delivery is currently an in-memory,
 best-effort queue rather than a durable message broker. Discord DMs are disabled
-in the beginner configuration.
+in the beginner configuration. Trusted-room ambient mode is also disabled until
+the safe default passes.
+
+Addressed attachments are fetched only from Discord's HTTPS attachment CDN,
+under strict count/size limits and private per-process temporary-file handling.
+Only signature-verified PNG/JPEG/GIF/WebP bodies are materialized; unsupported
+or spoofed attachment types remain metadata only.
 
 Do **not** attach the bridge's general MCP endpoint to the continuity agent. It
 contains raw-target send, DM, reaction, typing, file, and sticker tools that do
@@ -63,4 +69,5 @@ message text and can reach only the template's configured Telegram chat.
 Deployment is not complete when both services merely turn green. Test
 Telegram → agent → Telegram, Discord → agent → Discord, an immediate switch
 back to Telegram, a rapid two-Discord-channel switch, and native Discord typing
-before relying on the installation.
+before relying on the installation. Also test one small addressed image, an
+approval-gated continuation, and both independent service restarts.

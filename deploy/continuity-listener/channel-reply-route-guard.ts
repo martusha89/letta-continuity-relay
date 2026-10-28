@@ -5,6 +5,11 @@ import { createHash } from "node:crypto";
 const SAFE_CHANNEL_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const CHANNEL_OTID = /^cm-channel-[0-9a-f]{32}$/;
 
+export function isDiscordSourceChannel(channel, configuredChannelId = process.env.DISCORD_CHANNEL_ID) {
+  const configured = typeof configuredChannelId === "string" ? configuredChannelId.trim() : "";
+  return channel === (configured || "continuity-discord");
+}
+
 function textPartsFromContent(content) {
   if (typeof content === "string") return [content];
   if (!Array.isArray(content)) return [];
@@ -378,7 +383,7 @@ export default function activate(letta) {
       };
     }
     const { route } = resolved;
-    const discordSource = route.channel === "cass-discord" || route.channel === "continuity-discord";
+    const discordSource = isDiscordSourceChannel(route.channel);
 
     const rewritten = {
       ...event.args,

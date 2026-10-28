@@ -30,6 +30,8 @@ if (missing.length > 0) {
 
 const SNOWFLAKE = /^\d{17,20}$/;
 const TELEGRAM_ID = /^\d+$/;
+const CHANNEL_ID = /^[a-z][a-z0-9-]{0,63}$/;
+const CONVERSATION_ID = /^conv-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const seedOnly = process.env.SEED_ONLY === "1";
 const testHome = seedOnly ? process.env.CONTINUITY_TEST_HOME?.trim() : "";
 const home = testHome || process.env.HOME || "/root";
@@ -47,7 +49,10 @@ function commaList(name, value, validator) {
 
 const agentId = process.env.LETTA_AGENT_ID.trim();
 const conversationId = (process.env.LETTA_CONVERSATION_ID || "default").trim();
-if (!agentId || !conversationId) throw new Error("LETTA_AGENT_ID and LETTA_CONVERSATION_ID must not be blank");
+if (!agentId) throw new Error("LETTA_AGENT_ID must not be blank");
+if (conversationId !== "default" && !CONVERSATION_ID.test(conversationId)) {
+  throw new Error("LETTA_CONVERSATION_ID must be default or an exact conv-... UUID");
+}
 const telegramChatId = process.env.TELEGRAM_CHAT_ID.trim();
 if (!TELEGRAM_ID.test(telegramChatId)) throw new Error("TELEGRAM_CHAT_ID must be numeric");
 
@@ -63,6 +68,25 @@ if (!telegramAllowedUsers.includes(telegramChatId)) {
 
 const discordChannelIds = commaList("DISCORD_CHANNEL_IDS", process.env.DISCORD_CHANNEL_IDS, SNOWFLAKE);
 if (discordChannelIds.length === 0) throw new Error("At least one Discord channel ID is required");
+
+let discordConversationOverrides;
+try {
+  discordConversationOverrides = JSON.parse(process.env.DISCORD_CHANNEL_CONVERSATION_OVERRIDES || "{}");
+} catch {
+  throw new Error("DISCORD_CHANNEL_CONVERSATION_OVERRIDES must be strict JSON");
+}
+if (!discordConversationOverrides || typeof discordConversationOverrides !== "object" || Array.isArray(discordConversationOverrides)) {
+  throw new Error("DISCORD_CHANNEL_CONVERSATION_OVERRIDES must be a JSON object");
+}
+for (const [channelId, overrideConversationId] of Object.entries(discordConversationOverrides)) {
+  if (!discordChannelIds.includes(channelId)) {
+    throw new Error("DISCORD_CHANNEL_CONVERSATION_OVERRIDES contains a channel outside DISCORD_CHANNEL_IDS");
+  }
+  if (typeof overrideConversationId !== "string" ||
+      (overrideConversationId !== "default" && !CONVERSATION_ID.test(overrideConversationId))) {
+    throw new Error("DISCORD_CHANNEL_CONVERSATION_OVERRIDES values must be default or exact conv-... UUIDs");
+  }
+}
 
 const bridgeToken = process.env.DISCORD_BRIDGE_BEARER_TOKEN.trim();
 if (bridgeToken.length < 32) throw new Error("DISCORD_BRIDGE_BEARER_TOKEN must be at least 32 characters");
@@ -99,9 +123,14 @@ const now = new Date().toISOString();
 
 const lettaRoot = path.join(home, ".letta");
 const telegramDir = path.join(lettaRoot, "channels", "telegram");
-// Preserve the production channel identity. Installing under a second ID would
-// make Letta load two adapters that poll the same bridge.
-const discordChannelId = "cass-discord";
+const requestedDiscordChannelId = process.env.DISCORD_CHANNEL_ID?.trim();
+if (requestedDiscordChannelId && !CHANNEL_ID.test(requestedDiscordChannelId)) {
+  throw new Error("DISCORD_CHANNEL_ID must be a lowercase channel ID using letters, numbers, and hyphens");
+}
+if (requestedDiscordChannelId === "telegram") {
+  throw new Error("DISCORD_CHANNEL_ID must not replace the built-in Telegram channel");
+}
+const discordChannelId = requestedDiscordChannelId || "continuity-discord";
 const discordDir = path.join(lettaRoot, "channels", discordChannelId);
 const modsDir = path.join(lettaRoot, "mods");
 const discordPluginAsset = testHome && process.env.CONTINUITY_TEST_PLUGIN_PATH?.trim()
@@ -377,11 +406,12 @@ discordRouting.routes = discordRouting.routes.filter(route => {
 });
 
 for (const channelId of discordChannelIds) {
+  const routeConversationId = discordConversationOverrides[channelId] || conversationId;
   let route = discordRouting.routes.find(
     candidate => candidate?.accountId === discordAccountId && String(candidate?.chatId) === channelId,
   );
   if (route && !previousIds.has(channelId)) {
-    const sameTarget = route.agentId === agentId && route.conversationId === conversationId &&
+    const sameTarget = route.agentId === agentId && route.conversationId === routeConversationId &&
       route.chatType === "channel" && route.enabled !== false && route.outboundEnabled !== false;
     if (!sameTarget) throw new Error(`Discord route ${channelId} conflicts with existing unmanaged state`);
   }
@@ -397,7 +427,7 @@ for (const channelId of discordChannelIds) {
   }
   Object.assign(route, {
     agentId,
-    conversationId,
+    conversationId: routeConversationId,
     enabled: true,
     outboundEnabled: true,
     updatedAt: now,
@@ -450,6 +480,8 @@ healthServer.on("error", error => {
   process.exit(1);
 });
 
+console.log(`Launching the Letta listener with Node ${process.version}.`);
+
 child = spawn(
   "letta",
   [
@@ -499,10 +531,11 @@ child.on("error", error => {
 child.on("exit", (code, signal) => {
   ready = false;
   healthServer.close();
-  if (stopping && signal) process.exit(0);
+  if (stopping) process.exit(0);
   if (signal) {
     console.error(`Letta listener exited from signal ${signal}.`);
     process.exit(1);
   }
-  process.exit(code ?? 1);
+  console.error(`Letta listener exited unexpectedly with code ${code ?? "unknown"}.`);
+  process.exit(code === 0 ? 1 : (code ?? 1));
 });

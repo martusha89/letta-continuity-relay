@@ -34,7 +34,7 @@ const POLICY = {
   remoteMode: true,
 };
 
-const BRIDGE = { dmUserIds: [USER_ID], channelIds: [], roleIds: [], botCooldownMs: 30000, allowEveryone: false, queueLimit: 8, pollTimeoutMs: 50, jsonLimitBytes: 4096, rateLimitPerMinute: 1000, enabled: true, bearerToken: "b".repeat(32) };
+const BRIDGE = { dmUserIds: [USER_ID], channelIds: [], allMessageGuildIds: [], roleIds: [], botCooldownMs: 30000, allowEveryone: false, queueLimit: 8, pollTimeoutMs: 50, jsonLimitBytes: 4096, rateLimitPerMinute: 1000, enabled: true, bearerToken: "b".repeat(32) };
 
 function view(overrides = {}) {
   return {
@@ -76,6 +76,7 @@ test("bridge is disabled by default and needs no token", () => {
   assert.equal(cfg.bridge.bearerToken, null);
   assert.deepEqual(cfg.bridge.dmUserIds, []);
   assert.deepEqual(cfg.bridge.channelIds, []);
+  assert.deepEqual(cfg.bridge.allMessageGuildIds, []);
   assert.deepEqual(cfg.bridge.roleIds, []);
   assert.equal(cfg.bridge.botCooldownMs, 30000);
   assert.equal(cfg.bridge.allowEveryone, false);
@@ -113,7 +114,7 @@ test("enabling the bridge requires a dedicated 32+ char token distinct from the 
   }), /MCP_TRANSPORT=http/);
 });
 
-test("bridge inbound channel, DM, role, and bot cooldown policies are parsed and deduplicated", () => {
+test("bridge inbound channel, DM, trusted-guild, role, and bot cooldown policies are parsed and deduplicated", () => {
   const cfg = loadConfig({
     DISCORD_TOKEN: "not-a-real-token",
     MCP_TRANSPORT: "http",
@@ -124,12 +125,14 @@ test("bridge inbound channel, DM, role, and bot cooldown policies are parsed and
     DISCORD_BRIDGE_BEARER_TOKEN: "b".repeat(32),
     DISCORD_BRIDGE_DM_USER_IDS: `${USER_ID}, ${USER_ID}`,
     DISCORD_BRIDGE_CHANNEL_IDS: `${CHANNEL_ID}, ${CHANNEL_ID}`,
+    DISCORD_BRIDGE_ALL_MESSAGE_GUILD_IDS: `${GUILD_ID}, ${GUILD_ID}`,
     DISCORD_BRIDGE_ROLE_IDS: `${BOYS_ROLE_ID}, ${BOYS_ROLE_ID}`,
     DISCORD_BRIDGE_BOT_COOLDOWN_MS: "45000",
     DISCORD_BRIDGE_ALLOW_EVERYONE: "true",
   });
   assert.deepEqual(cfg.bridge.dmUserIds, [USER_ID]);
   assert.deepEqual(cfg.bridge.channelIds, [CHANNEL_ID]);
+  assert.deepEqual(cfg.bridge.allMessageGuildIds, [GUILD_ID]);
   assert.deepEqual(cfg.bridge.roleIds, [BOYS_ROLE_ID]);
   assert.equal(cfg.bridge.botCooldownMs, 45000);
   assert.equal(cfg.bridge.allowEveryone, true);
@@ -142,6 +145,11 @@ test("bridge inbound channel, DM, role, and bot cooldown policies are parsed and
     DISCORD_TOKEN: "not-a-real-token",
     MCP_CONFIG_PATH: "/definitely/missing/config.json",
     DISCORD_BRIDGE_CHANNEL_IDS: "not-a-snowflake",
+  }), /Discord snowflakes/);
+  assert.throws(() => loadConfig({
+    DISCORD_TOKEN: "not-a-real-token",
+    MCP_CONFIG_PATH: "/definitely/missing/config.json",
+    DISCORD_BRIDGE_ALL_MESSAGE_GUILD_IDS: "not-a-snowflake",
   }), /Discord snowflakes/);
   assert.throws(() => loadConfig({
     DISCORD_TOKEN: "not-a-real-token",
@@ -311,43 +319,83 @@ test("gateInbound ignores self-bot, webhook, system, and missing authors", () =>
   assert.equal(gateInbound(view({ author: null }), POLICY, BRIDGE, BOT_ID).reason, "system_author");
 });
 
-test("bots in permitted channels require a direct relay-bot mention", () => {
+test("trusted all-message guild delivers ambient human and companion-bot messages", () => {
+  const trustedBridge = { ...BRIDGE, allMessageGuildIds: [GUILD_ID] };
+  const ambientHuman = gateInbound(view({
+    content: "ambient human chatter",
+    mentionsUserIds: [],
+  }), POLICY, trustedBridge, BOT_ID);
+  assert.equal(ambientHuman.verdict, "deliver");
+  assert.equal(ambientHuman.message.text, "ambient human chatter");
+  assert.equal(ambientHuman.message.authorIsBot, false);
+
+  const ambientCompanion = gateInbound(view({
+    author: { id: COMPANION_BOT_ID, username: "companion", bot: true, system: false },
+    content: "ambient bot chatter",
+    mentionsUserIds: [],
+  }), POLICY, trustedBridge, BOT_ID);
+  assert.equal(ambientCompanion.verdict, "deliver");
+  assert.equal(ambientCompanion.message.authorIsBot, true);
+});
+
+test("trusted all-message guild never bypasses self-bot, webhook, system, guild, or channel boundaries", () => {
+  const trustedBridge = { ...BRIDGE, allMessageGuildIds: [GUILD_ID, OTHER_GUILD] };
+  assert.equal(gateInbound(view({
+    author: { id: BOT_ID, username: "self", bot: true, system: false },
+    mentionsUserIds: [],
+  }), POLICY, trustedBridge, BOT_ID).reason, "bot_author");
+  assert.equal(gateInbound(view({ webhookId: "123", mentionsUserIds: [] }), POLICY, trustedBridge, BOT_ID).reason, "webhook_author");
+  assert.equal(gateInbound(view({ system: true, mentionsUserIds: [] }), POLICY, trustedBridge, BOT_ID).reason, "system_author");
+  assert.equal(gateInbound(view({ guildId: OTHER_GUILD, mentionsUserIds: [] }), POLICY, trustedBridge, BOT_ID).reason, "guild_not_allowed");
+  assert.equal(gateInbound(view({ channelId: OTHER_CHANNEL, mentionsUserIds: [] }), POLICY, trustedBridge, BOT_ID).reason, "channel_not_allowed");
+});
+
+test("bots in permitted channels require a direct relay-bot mention or reply", () => {
   const trusted = { id: COMPANION_BOT_ID, username: "companion", bot: true, system: false };
   const directMention = gateInbound(view({
     author: trusted,
     content: `<@${BOT_ID}> hello back`,
     mentionsUserIds: [BOT_ID],
-    referencedMessageId: "123",
-    referencedAuthorId: BOT_ID,
   }), POLICY, BRIDGE, BOT_ID);
   assert.equal(directMention.verdict, "deliver");
   assert.equal(directMention.message.text, "hello back");
   assert.equal(directMention.message.authorIsBot, true);
 
-  assert.equal(gateInbound(view({
+  const directReply = gateInbound(view({
     author: trusted,
     content: "reply without a direct mention",
     mentionsUserIds: [],
     referencedMessageId: "123",
     referencedAuthorId: BOT_ID,
-  }), POLICY, BRIDGE, BOT_ID).reason, "bot_direct_mention_required");
+  }), POLICY, BRIDGE, BOT_ID);
+  assert.equal(directReply.verdict, "deliver");
+  assert.equal(directReply.message.text, "reply without a direct mention");
+  assert.equal(directReply.message.isMention, false);
+
+  assert.equal(gateInbound(view({
+    author: trusted,
+    content: "reply to another author",
+    mentionsUserIds: [],
+    referencedMessageId: "123",
+    referencedAuthorId: USER_ID,
+  }), POLICY, BRIDGE, BOT_ID).reason, "bot_direct_address_required");
   assert.equal(gateInbound(view({
     author: trusted,
     content: `<@&${BOYS_ROLE_ID}> role ping`,
     mentionsUserIds: [],
     mentionsRoleIds: [BOYS_ROLE_ID],
-  }), POLICY, { ...BRIDGE, roleIds: [BOYS_ROLE_ID] }, BOT_ID).reason, "bot_direct_mention_required");
+  }), POLICY, { ...BRIDGE, roleIds: [BOYS_ROLE_ID] }, BOT_ID).reason, "bot_direct_address_required");
   assert.equal(gateInbound(view({
     author: trusted,
     content: "@everyone announcement",
     mentionsUserIds: [],
     mentionsEveryone: true,
-  }), POLICY, { ...BRIDGE, allowEveryone: true }, BOT_ID).reason, "bot_direct_mention_required");
+  }), POLICY, { ...BRIDGE, allowEveryone: true }, BOT_ID).reason, "bot_direct_address_required");
   assert.equal(gateInbound(view({
     author: trusted,
     content: "ambient bot chatter",
     mentionsUserIds: [],
-  }), POLICY, BRIDGE, BOT_ID).reason, "bot_direct_mention_required");
+  }), POLICY, BRIDGE, BOT_ID).reason, "bot_direct_address_required");
   assert.equal(gateInbound(view({
     author: { id: "888888888888888888", username: "another companion", bot: true, system: false },
   }), POLICY, BRIDGE, BOT_ID).verdict, "deliver");
@@ -389,34 +437,76 @@ test("companion bots never bypass guild, DM, webhook, or system boundaries", () 
   assert.equal(gateInbound(view({ author: trusted, system: true }), POLICY, BRIDGE, BOT_ID).reason, "system_author");
 });
 
-test("inbound pipeline applies a bounded per-bot/per-channel cooldown after acceptance", async () => {
+test("inbound pipeline resolves bot replies fail-closed and applies reply cooldown", async () => {
   let messageHandler;
   const logs = [];
-  const secondBot = "888888888888888888";
-  const bridge = {
-    ...BRIDGE,
-    botCooldownMs: 60_000,
-  };
+  const bridge = { ...BRIDGE, botCooldownMs: 60_000 };
   const pipeline = createInboundPipeline({
-    policy: { ...POLICY, allowedChannelIds: [] },
+    policy: POLICY,
     bridge,
     botUserId: () => BOT_ID,
     log: line => logs.push(line),
   });
   pipeline.attach({ on(eventName, handler) { assert.equal(eventName, "messageCreate"); messageHandler = handler; } });
-  const discordMessage = (id, channelId = CHANNEL_ID, authorId = COMPANION_BOT_ID) => ({
+  const discordReply = (id, fetchReference) => ({
     id,
-    author: { id: authorId, username: "companion", bot: true, system: false },
+    author: { id: COMPANION_BOT_ID, username: "companion", bot: true, system: false },
     webhookId: null,
     system: false,
-    content: `<@${BOT_ID}> hello`,
+    content: "reply without a mention",
     createdAt: new Date("2026-01-01T00:00:00Z"),
     guild: { name: "Test Guild" },
     guildId: GUILD_ID,
-    channelId,
+    channelId: CHANNEL_ID,
     channel: { name: "general", isThread: () => false },
     mentions: {
-      users: new Map([[BOT_ID, { id: BOT_ID }]]),
+      users: new Map(),
+      roles: new Map(),
+      everyone: false,
+      repliedUser: null,
+    },
+    reference: { messageId: "900000000000000001" },
+    attachments: [],
+    fetchReference,
+  });
+
+  messageHandler(discordReply("100000000000000010", async () => ({ author: { id: BOT_ID } })));
+  await new Promise(resolve => setImmediate(resolve));
+  messageHandler(discordReply("100000000000000011", async () => ({ author: { id: BOT_ID } })));
+  messageHandler(discordReply("100000000000000012", async () => { throw new Error("missing reference"); }));
+  messageHandler(discordReply("100000000000000013", async () => ({ author: { id: USER_ID } })));
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(pipeline.queue.size, 1);
+  assert.equal(pipeline.queue.since(0)[0].message.authorIsBot, true);
+  assert.equal(pipeline.queue.since(0)[0].message.text, "reply without a mention");
+  assert.ok(logs.includes("[bridge] inbound ignored: bot_cooldown"));
+  assert.equal(logs.filter(line => line === "[bridge] inbound ignored: bot_direct_address_required").length, 2);
+});
+
+test("trusted-room ambient bot traffic still receives the per-bot/channel cooldown", async () => {
+  let messageHandler;
+  const logs = [];
+  const pipeline = createInboundPipeline({
+    policy: POLICY,
+    bridge: { ...BRIDGE, allMessageGuildIds: [GUILD_ID], botCooldownMs: 60_000 },
+    botUserId: () => BOT_ID,
+    log: line => logs.push(line),
+  });
+  pipeline.attach({ on(_eventName, handler) { messageHandler = handler; } });
+  const ambientBotMessage = id => ({
+    id,
+    author: { id: COMPANION_BOT_ID, username: "companion", bot: true, system: false },
+    webhookId: null,
+    system: false,
+    content: "ambient trusted-room message",
+    createdAt: new Date("2026-01-01T00:00:00Z"),
+    guild: { name: "Test Guild" },
+    guildId: GUILD_ID,
+    channelId: CHANNEL_ID,
+    channel: { name: "general", isThread: () => false },
+    mentions: {
+      users: new Map(),
       roles: new Map(),
       everyone: false,
       repliedUser: null,
@@ -424,14 +514,50 @@ test("inbound pipeline applies a bounded per-bot/per-channel cooldown after acce
     reference: null,
     attachments: [],
   });
-  messageHandler(discordMessage("100000000000000010"));
-  messageHandler(discordMessage("100000000000000011"));
-  messageHandler(discordMessage("100000000000000012", OTHER_CHANNEL));
-  messageHandler(discordMessage("100000000000000013", CHANNEL_ID, secondBot));
+
+  messageHandler(ambientBotMessage("100000000000000017"));
+  messageHandler(ambientBotMessage("100000000000000018"));
   await new Promise(resolve => setImmediate(resolve));
-  assert.equal(pipeline.queue.size, 3);
+
+  assert.equal(pipeline.queue.size, 1);
   assert.equal(pipeline.queue.since(0)[0].message.authorIsBot, true);
   assert.ok(logs.includes("[bridge] inbound ignored: bot_cooldown"));
+});
+
+test("inbound pipeline accepts bot replies when repliedUser already identifies the relay", async () => {
+  let messageHandler;
+  let fetchCalls = 0;
+  const pipeline = createInboundPipeline({
+    policy: POLICY,
+    bridge: { ...BRIDGE, botCooldownMs: 60_000 },
+    botUserId: () => BOT_ID,
+  });
+  pipeline.attach({ on(_eventName, handler) { messageHandler = handler; } });
+  messageHandler({
+    id: "100000000000000014",
+    author: { id: COMPANION_BOT_ID, username: "companion", bot: true, system: false },
+    webhookId: null,
+    system: false,
+    content: "cached direct reply",
+    createdAt: new Date("2026-01-01T00:00:00Z"),
+    guild: { name: "Test Guild" },
+    guildId: GUILD_ID,
+    channelId: CHANNEL_ID,
+    channel: { name: "general", isThread: () => false },
+    mentions: {
+      users: new Map(),
+      roles: new Map(),
+      everyone: false,
+      repliedUser: { id: BOT_ID },
+    },
+    reference: { messageId: "900000000000000002" },
+    attachments: [],
+    async fetchReference() { fetchCalls += 1; return { author: { id: USER_ID } }; },
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fetchCalls, 0);
+  assert.equal(pipeline.queue.size, 1);
+  assert.equal(pipeline.queue.since(0)[0].message.text, "cached direct reply");
 });
 
 test("gateInbound enforces guild and channel policy", () => {

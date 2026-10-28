@@ -69,7 +69,7 @@ export type IgnoreReason =
   | "guild_not_allowed"
   | "channel_not_allowed"
   | "dm_not_allowed"
-  | "bot_direct_mention_required"
+  | "bot_direct_address_required"
   | "bot_cooldown"
   | "not_addressed_to_bot"
   | "duplicate"

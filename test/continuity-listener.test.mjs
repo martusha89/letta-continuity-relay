@@ -15,6 +15,7 @@ const PROACTIVE_TELEGRAM = join(ROOT, "deploy", "continuity-listener", "proactiv
 const AGENT_ID = "agent-11111111-1111-4111-8111-111111111111";
 const FIRST_CHANNEL = "222222222222222222";
 const SECOND_CHANNEL = "333333333333333333";
+const OVERRIDE_CONVERSATION = "conv-55555555-5555-4555-8555-555555555555";
 const BRIDGE_TOKEN = "bridge-secret-" + "b".repeat(32);
 const TELEGRAM_TOKEN = "telegram-secret-token";
 
@@ -72,11 +73,11 @@ test("continuity listener seed creates private Telegram and Discord routes into 
   assert.equal(telegramRoutes.routes[0].agentId, AGENT_ID);
   assert.equal(telegramRoutes.routes[0].conversationId, "default");
 
-  const discordDir = join(root, "channels", "cass-discord");
+  const discordDir = join(root, "channels", "continuity-discord");
   const manifest = await readJson(join(discordDir, "channel.json"));
-  assert.equal(manifest.id, "cass-discord");
+  assert.equal(manifest.id, "continuity-discord");
   const discord = await readJson(join(discordDir, "accounts.json"));
-  assert.equal(discord.accounts[0].channel, "cass-discord");
+  assert.equal(discord.accounts[0].channel, "continuity-discord");
   assert.equal(discord.accounts[0].config.base_url, "http://discord-bridge.railway.internal:3001");
   assert.equal(discord.accounts[0].config.auth, BRIDGE_TOKEN);
   const discordRoutes = await readJson(join(discordDir, "routing.yaml"));
@@ -113,10 +114,68 @@ test("continuity listener seed creates private Telegram and Discord routes into 
   }
 });
 
+test("continuity listener validates and installs an explicit portable Discord channel ID", async () => {
+  const selected = await runSeed({ env: { DISCORD_CHANNEL_ID: "house-discord" } });
+  assert.equal(selected.result.status, 0, selected.result.stderr);
+  const directory = join(selected.home, ".letta", "channels", "house-discord");
+  assert.equal((await readJson(join(directory, "channel.json"))).id, "house-discord");
+  assert.equal((await readJson(join(directory, "accounts.json"))).accounts[0].channel, "house-discord");
+
+  for (const invalid of ["house_discord", "House-Discord", "../escape", "telegram", ""]) {
+    const { result } = await runSeed({ env: { DISCORD_CHANNEL_ID: invalid || " " } });
+    if (invalid === "") {
+      assert.equal(result.status, 0, result.stderr);
+    } else {
+      assert.notEqual(result.status, 0, invalid);
+      assert.match(result.stderr, /DISCORD_CHANNEL_ID/, invalid);
+    }
+  }
+});
+
+test("continuity listener validates conversation IDs and supports explicit per-channel overrides", async () => {
+  const selected = await runSeed({
+    env: {
+      DISCORD_CHANNEL_IDS: `${FIRST_CHANNEL},${SECOND_CHANNEL}`,
+      DISCORD_CHANNEL_CONVERSATION_OVERRIDES: JSON.stringify({ [SECOND_CHANNEL]: OVERRIDE_CONVERSATION }),
+    },
+  });
+  assert.equal(selected.result.status, 0, selected.result.stderr);
+  const routes = await readJson(join(
+    selected.home,
+    ".letta",
+    "channels",
+    "continuity-discord",
+    "routing.yaml",
+  ));
+  assert.equal(routes.routes.find(route => route.chatId === FIRST_CHANNEL).conversationId, "default");
+  assert.equal(routes.routes.find(route => route.chatId === SECOND_CHANNEL).conversationId, OVERRIDE_CONVERSATION);
+
+  for (const env of [
+    { LETTA_CONVERSATION_ID: "not-a-conversation" },
+    { DISCORD_CHANNEL_CONVERSATION_OVERRIDES: "{" },
+    { DISCORD_CHANNEL_CONVERSATION_OVERRIDES: "[]" },
+    { DISCORD_CHANNEL_CONVERSATION_OVERRIDES: JSON.stringify({ [SECOND_CHANNEL]: "default" }) },
+    { DISCORD_CHANNEL_CONVERSATION_OVERRIDES: JSON.stringify({ [FIRST_CHANNEL]: "conv-invalid" }) },
+  ]) {
+    const { result } = await runSeed({ env });
+    assert.notEqual(result.status, 0, JSON.stringify(env));
+    assert.match(result.stderr, /CONVERSATION_ID|CONVERSATION_OVERRIDES/, JSON.stringify(env));
+  }
+});
+
+test("continuity listener preserves an existing continuity-discord volume when no channel ID is selected", async () => {
+  const home = await mkdtemp(join(tmpdir(), "continuity-listener-existing-"));
+  const existing = join(home, ".letta", "channels", "continuity-discord");
+  await mkdir(existing, { recursive: true, mode: 0o700 });
+  const { result } = await runSeed({ home });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal((await readJson(join(existing, "channel.json"))).id, "continuity-discord");
+});
+
 test("continuity listener reconciliation removes retired managed routes and preserves unrelated routes", async () => {
   const first = await runSeed();
   assert.equal(first.result.status, 0, first.result.stderr);
-  const routingPath = join(first.home, ".letta", "channels", "cass-discord", "routing.yaml");
+  const routingPath = join(first.home, ".letta", "channels", "continuity-discord", "routing.yaml");
   const routing = await readJson(routingPath);
   routing.routes.push({
     accountId: "someone-else",
@@ -145,7 +204,7 @@ test("continuity listener reconciliation removes retired managed routes and pres
 test("continuity listener treats routing.yaml as authoritative and reconciles a stale JSON fallback", async () => {
   const first = await runSeed();
   assert.equal(first.result.status, 0, first.result.stderr);
-  const directory = join(first.home, ".letta", "channels", "cass-discord");
+  const directory = join(first.home, ".letta", "channels", "continuity-discord");
   const yamlPath = join(directory, "routing.yaml");
   const jsonPath = join(directory, "routing.json");
   await writeFile(jsonPath, `${JSON.stringify({ routes: [{
@@ -242,7 +301,7 @@ test("generic route guard pins MessageChannel calls to the inbound source", asyn
     enabled: true,
     outboundEnabled: true,
   }] }), { mode: 0o600 });
-  const liveDiscordRouteDirectory = join(directory, "home", ".letta", "channels", "cass-discord");
+  const liveDiscordRouteDirectory = join(directory, "home", ".letta", "channels", "continuity-discord");
   await mkdir(liveDiscordRouteDirectory, { recursive: true });
   await writeFile(join(liveDiscordRouteDirectory, "routing.yaml"), JSON.stringify({ routes: [{
     accountId: "main",
@@ -261,6 +320,10 @@ test("generic route guard pins MessageChannel calls to the inbound source", asyn
   try {
     const handlers = new Map();
     const guard = await import(`${pathToFileURL(modulePath).href}?test=${Date.now()}`);
+    assert.equal(guard.isDiscordSourceChannel("continuity-discord", undefined), true);
+    assert.equal(guard.isDiscordSourceChannel("house-discord", "house-discord"), true);
+    assert.equal(guard.isDiscordSourceChannel("continuity-discord", "house-discord"), false);
+    assert.equal(guard.isDiscordSourceChannel("other-discord", "house-discord"), false);
     const dispose = guard.default({
       capabilities: { events: { turns: true, tools: true } },
       events: {
@@ -301,11 +364,11 @@ test("generic route guard pins MessageChannel calls to the inbound source", asyn
     const sameRouteDifferentSources = [
       channelUserMessage(
         "discord-source-a",
-        '<channel-notification source="cass-discord" chat_id="888888888888888888" account_id="main" message_id="source-a">first</channel-notification>',
+        '<channel-notification source="continuity-discord" chat_id="888888888888888888" account_id="main" message_id="source-a">first</channel-notification>',
       ),
       channelUserMessage(
         "discord-source-b",
-        '<channel-notification source="cass-discord" chat_id="888888888888888888" account_id="main" message_id="source-b">second</channel-notification>',
+        '<channel-notification source="continuity-discord" chat_id="888888888888888888" account_id="main" message_id="source-b">second</channel-notification>',
       ),
     ];
     assert.equal(guard.extractSingleChannelRoute(sameRouteDifferentSources), null);
@@ -356,7 +419,7 @@ test("generic route guard pins MessageChannel calls to the inbound source", asyn
       { type: "text", text: "<system-reminder>environment</system-reminder>" },
       {
         type: "text",
-        text: '<channel-notification source="cass-discord" chat_id="888888888888888888" account_id="main" message_id="100">switch</channel-notification>',
+        text: '<channel-notification source="continuity-discord" chat_id="888888888888888888" account_id="main" message_id="100">switch</channel-notification>',
       },
     ]);
     const concurrentHistory = [
@@ -379,7 +442,7 @@ test("generic route guard pins MessageChannel calls to the inbound source", asyn
     }, {
       conversation: { async getHistory() { return concurrentHistory; } },
     });
-    assert.equal(switched.args.channel, "cass-discord");
+    assert.equal(switched.args.channel, "continuity-discord");
     assert.equal(switched.args.chat_id, "888888888888888888");
     assert.equal(switched.args.accountId, "main");
     assert.equal(switched.args.replyTo, "100");
@@ -394,7 +457,7 @@ test("generic route guard pins MessageChannel calls to the inbound source", asyn
     }, {
       conversation: { async getHistory() { return concurrentHistory; } },
     });
-    assert.equal(pinnedReaction.args.channel, "cass-discord");
+    assert.equal(pinnedReaction.args.channel, "continuity-discord");
     assert.equal(pinnedReaction.args.chat_id, "888888888888888888");
     assert.equal(pinnedReaction.args.replyTo, "100");
     assert.equal(pinnedReaction.args.replyToMessageId, "100");
@@ -405,7 +468,7 @@ test("generic route guard pins MessageChannel calls to the inbound source", asyn
       conversationId: "default",
       toolCallId: "telegram-call",
       toolName: "MessageChannel",
-      args: { action: "send", channel: "cass-discord", chat_id: "stale" },
+      args: { action: "send", channel: "continuity-discord", chat_id: "stale" },
     }, {
       conversation: { async getHistory() { return concurrentHistory; } },
     });
@@ -428,7 +491,7 @@ test("generic route guard pins MessageChannel calls to the inbound source", asyn
       conversationId: "default",
       toolCallId: "telegram-second-send",
       toolName: "MessageChannel",
-      args: { action: "send", channel: "cass-discord", chat_id: "stale" },
+      args: { action: "send", channel: "continuity-discord", chat_id: "stale" },
     }, {
       conversation: { async getHistory() { return sequentialHistory; } },
     });
@@ -698,7 +761,7 @@ test("generic route guard pins MessageChannel calls to the inbound source", asyn
       conversationId: "default",
       toolCallId: "unknown-call",
       toolName: "MessageChannel",
-      args: { action: "send", channel: "cass-discord", chat_id: "stale" },
+      args: { action: "send", channel: "continuity-discord", chat_id: "stale" },
     }, {
       conversation: { async getHistory() { return concurrentHistory; } },
     });
@@ -707,7 +770,7 @@ test("generic route guard pins MessageChannel calls to the inbound source", asyn
     for (const [label, history, callId] of [
       ["thread mismatch", [
         toolMessage("thread-run", "thread-call"),
-        channelUserMessage("thread-run", '<channel-notification source="cass-discord" chat_id="888888888888888888" account_id="main" thread_id="forged-thread" message_id="thread-message">thread</channel-notification>'),
+        channelUserMessage("thread-run", '<channel-notification source="continuity-discord" chat_id="888888888888888888" account_id="main" thread_id="forged-thread" message_id="thread-message">thread</channel-notification>'),
       ], "thread-call"],
       ["duplicate tool carrier", [
         toolMessage("duplicate-a", "duplicate-call"),
@@ -765,7 +828,7 @@ test("generic route guard pins MessageChannel calls to the inbound source", asyn
       conversationId: "default",
       toolCallId: "telegram-call",
       toolName: "MessageChannel",
-      args: { action: "send", channel: "cass-discord", chat_id: "stale" },
+      args: { action: "send", channel: "continuity-discord", chat_id: "stale" },
     }, {
       conversation: { async getHistory() { throw new Error("offline"); } },
     });

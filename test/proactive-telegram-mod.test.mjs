@@ -33,7 +33,7 @@ test("proactive Telegram sends to only the configured chat and verifies its rece
     }), { status: 200, headers: { "content-type": "application/json; charset=utf-8" } });
   });
   assert.equal(await tool.run({ args: { message: "btw, TSN is lively and I am fine. x" } }),
-    "Private Telegram update sent to Marta (message_id: 8364)");
+    "Private Telegram update sent to the configured chat (message_id: 8364)");
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, `https://api.telegram.org/bot${TOKEN}/sendMessage`);
   assert.deepEqual(JSON.parse(calls[0].options.body), {
