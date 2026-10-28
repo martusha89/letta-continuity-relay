@@ -42,6 +42,12 @@ the beginner deployment; listener traffic stays on Railway's private network.
 
 ### Generated or fixed values
 
+The ordinary defaults below are built into the bridge image rather than
+serialized as Railway service variables. Railway's template generator turns
+each ordinary service variable into another user prompt; keeping defaults in
+the image preserves the seven-input beginner contract. The two `secret(64)`
+credentials remain generated template variables.
+
 ```dotenv
 PORT=3001
 MCP_TRANSPORT=http
@@ -111,6 +117,12 @@ same `/ready` endpoint.
 | `TELEGRAM_CHAT_ID` | **Required configurable value.** Numeric private-chat ID to allow and route. |
 
 ### References and fixed values
+
+The listener image and entrypoint provide the ordinary defaults below when
+they are omitted. They are intentionally absent from the source project's
+service-variable list so they do not become extra required fields on the
+generated template page. Only the three cross-service references are
+serialized as pre-configured variables.
 
 ```dotenv
 LETTA_BASE_URL=https://api.letta.com

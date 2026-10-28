@@ -30,7 +30,6 @@ async function runSeed(overrides = {}) {
     CONTINUITY_TEST_PROACTIVE_TELEGRAM_PATH: PROACTIVE_TELEGRAM,
     LETTA_API_KEY: "letta-secret-key",
     LETTA_AGENT_ID: AGENT_ID,
-    LETTA_CONVERSATION_ID: "default",
     TELEGRAM_BOT_TOKEN: TELEGRAM_TOKEN,
     TELEGRAM_CHAT_ID: "444444444444444444",
     DISCORD_BRIDGE_BASE_URL: "http://discord-bridge.railway.internal:3001",
@@ -63,6 +62,9 @@ test("continuity listener seed creates private Telegram and Discord routes into 
   const telegram = await readJson(join(root, "channels", "telegram", "accounts.json"));
   const telegramAccount = telegram.accounts[0];
   assert.equal(telegramAccount.channel, "telegram");
+  assert.equal(telegramAccount.accountId, "continuity-main");
+  assert.equal(telegramAccount.displayName, "Continuity Telegram");
+  assert.equal(telegramAccount.rich_private_chat_default, false);
   assert.equal(telegramAccount.dmPolicy, "allowlist");
   assert.deepEqual(telegramAccount.allowedUsers, ["444444444444444444"]);
   assert.equal(telegramAccount.binding.agentId, AGENT_ID);
@@ -76,8 +78,10 @@ test("continuity listener seed creates private Telegram and Discord routes into 
   const discordDir = join(root, "channels", "continuity-discord");
   const manifest = await readJson(join(discordDir, "channel.json"));
   assert.equal(manifest.id, "continuity-discord");
+  assert.equal(manifest.displayName, "Continuity Discord");
   const discord = await readJson(join(discordDir, "accounts.json"));
   assert.equal(discord.accounts[0].channel, "continuity-discord");
+  assert.equal(discord.accounts[0].accountId, "continuity-main");
   assert.equal(discord.accounts[0].config.base_url, "http://discord-bridge.railway.internal:3001");
   assert.equal(discord.accounts[0].config.auth, BRIDGE_TOKEN);
   const discordRoutes = await readJson(join(discordDir, "routing.yaml"));

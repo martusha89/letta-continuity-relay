@@ -19,12 +19,13 @@ export default defineRailway(() => {
     healthcheckTimeout: 120,
     replicas: 1,
     deploy: {
+      // Railway's template serializer needs an explicit empty schedule to
+      // distinguish an ordinary always-on service from an unconfigured cron.
+      cronSchedule: "",
       restartPolicyType: "ON_FAILURE",
       restartPolicyMaxRetries: 10,
     },
     env: {
-      MCP_TRANSPORT: "http",
-      MCP_HOST: "0.0.0.0",
       MCP_HTTP_BEARER_TOKEN: {
         description: "Generated administrative MCP credential. The beginner template does not expose a public bridge domain.",
         isSealed: true,
@@ -48,16 +49,6 @@ export default defineRailway(() => {
         description: "Required comma-separated 17–20 digit Discord channel or forum-parent IDs.",
         isOptional: false,
       },
-      DISCORD_BRIDGE_ENABLED: "true",
-      DISCORD_ALLOWED_DM_USER_IDS: "",
-      DISCORD_ALLOWED_MENTION_USER_IDS: "",
-      DISCORD_ALLOWED_MENTION_ROLE_IDS: "",
-      DISCORD_BRIDGE_DM_USER_IDS: "",
-      DISCORD_BRIDGE_ROLE_IDS: "",
-      DISCORD_BRIDGE_ALL_MESSAGE_GUILD_IDS: "",
-      DISCORD_BRIDGE_PROACTIVE_DESTINATIONS_JSON: "",
-      DISCORD_BRIDGE_BOT_COOLDOWN_MS: "30000",
-      DISCORD_BRIDGE_ALLOW_EVERYONE: "false",
     },
   });
 
@@ -74,6 +65,8 @@ export default defineRailway(() => {
     healthcheckTimeout: 180,
     replicas: 1,
     deploy: {
+      // See the bridge service note above. An empty string means no cron.
+      cronSchedule: "",
       restartPolicyType: "ON_FAILURE",
       restartPolicyMaxRetries: 10,
       overlapSeconds: 0,
@@ -82,7 +75,6 @@ export default defineRailway(() => {
       "/root": state,
     },
     env: {
-      LETTA_BASE_URL: "https://api.letta.com",
       LETTA_API_KEY: {
         description: "Required Letta API key with access to the selected cloud agent.",
         isOptional: false,
@@ -101,18 +93,6 @@ export default defineRailway(() => {
         description: "Required numeric private Telegram chat ID to allow and route.",
         isOptional: false,
       },
-      LETTA_CONVERSATION_ID: "default",
-      LETTA_ENV_NAME: "continuity-railway",
-      LETTA_CHANNEL_CREDENTIALS_STORE: "file",
-      LETTA_RESTORE_ENABLED_CHANNELS: "1",
-      LETTA_LOCAL_BACKEND_EXPERIMENTAL: "0",
-      TELEGRAM_ACCOUNT_ID: "continuity-main",
-      TELEGRAM_DISPLAY_NAME: "Continuity Telegram",
-      TELEGRAM_RICH_MESSAGES: "false",
-      DISCORD_CHANNEL_ID: "continuity-discord",
-      DISCORD_ACCOUNT_ID: "continuity-main",
-      DISCORD_DISPLAY_NAME: "Continuity Discord",
-      DISCORD_CHANNEL_CONVERSATION_OVERRIDES: "{}",
       DISCORD_BRIDGE_BASE_URL: "http://${{discord-bridge.RAILWAY_PRIVATE_DOMAIN}}:3001",
       DISCORD_BRIDGE_BEARER_TOKEN: bridge.env.DISCORD_BRIDGE_BEARER_TOKEN,
       DISCORD_CHANNEL_IDS: bridge.env.DISCORD_ALLOWED_CHANNEL_IDS,
