@@ -9,11 +9,11 @@ The listener is deliberately single-purpose:
 
 - seed one allowlisted Telegram private chat;
 - seed exact Discord channel routes;
-- install the audited bridge plugin under the existing production channel ID
-  `cass-discord` and generic display name **Continuity Discord**;
+- install the audited bridge plugin under the portable channel ID
+  `continuity-discord` and generic display name **Continuity Discord**;
 - install a deterministic reply-route guard scoped to the selected agent and
   conversation;
-- start one `letta server` process with `telegram,cass-discord`;
+- start one `letta server` process with `telegram,continuity-discord`;
 - retain account, route, pairing, and listener state on a `/root` volume.
 
 ## Deliberate proactive Discord messages
@@ -91,13 +91,15 @@ services.
 | --- | --- | --- |
 | `LETTA_BASE_URL` | `https://api.letta.com` | Letta API endpoint. |
 | `LETTA_CONVERSATION_ID` | `default` | Shared conversation used by both channels. |
-| `LETTA_ENV_NAME` | `continuity-railway` | Value passed to Letta 0.32.12 as `--computer-name`. The legacy variable name is retained for compatibility with existing deployments. |
+| `LETTA_ENV_NAME` | `continuity-railway` | Value passed to Letta Code as `--computer-name`. The legacy variable name is retained for compatibility with existing deployments. |
 | `TELEGRAM_ALLOWED_USER_IDS` | `TELEGRAM_CHAT_ID` | Comma-separated Telegram user IDs allowed to use the private bot. |
 | `TELEGRAM_ACCOUNT_ID` | `continuity-main` | Stable local channel account ID. |
 | `TELEGRAM_DISPLAY_NAME` | `Continuity Telegram` | Local account label. |
 | `TELEGRAM_RICH_MESSAGES` | `false` | Set to exact string `true` only when the user's Telegram clients render rich private messages correctly. |
 | `DISCORD_ACCOUNT_ID` | `continuity-main` | Stable local custom-channel account ID. |
 | `DISCORD_DISPLAY_NAME` | `Continuity Discord` | Local custom-channel label. |
+| `DISCORD_CHANNEL_ID` | `continuity-discord` | Portable local custom-channel ID. Leave unset only when retaining an existing legacy volume. |
+| `DISCORD_CHANNEL_CONVERSATION_OVERRIDES` | `{}` | Strict JSON mapping from an ID already in `DISCORD_CHANNEL_IDS` to `default` or an exact `conv-...` UUID. Leave `{}` to share the main conversation everywhere. |
 | `LETTA_DEBUG` | unset | Set to `1` to start Letta with debug logging. Do not leave enabled casually in shared logs. |
 | `SEED_ONLY` | `0` | Set to `1` to write validated state and exit without starting Letta. |
 
@@ -128,6 +130,9 @@ against the installed Letta version before relying on it.
 - Run exactly one replica. Telegram polling, the Discord bridge long poll, and
   listener locks are not a horizontally-scaled workload.
 - State and credential files are written atomically with mode `0600`.
+- On container startup, stale listener locks are moved to private
+  `.orphaned-*` evidence files rather than deleted. Symlinked, non-file,
+  wrongly-owned, or writable-by-others lock paths abort startup.
 - The reply guard accepts only the gateway-generated notification wrapper at
   the beginning of a content part and verifies its account/chat against the
   selected agent's mode-0600 route registry before rewriting a tool call. It
@@ -137,12 +142,10 @@ against the installed Letta version before relying on it.
   Channel message text is XML-escaped by Letta and cannot mint a second trusted
   notification tag.
 - The bootstrap logs no token or API-key values.
-- Letta 0.32.12's own structured listener-lock handling remains intact. The
-  bootstrap does not delete or bypass locks; a live competing listener must
-  cause startup to fail rather than creating duplicate delivery.
 - `/health` proves the bootstrap process is alive. `/ready` proves the Letta
-  child process spawned and has not exited; it is not an end-to-end Telegram,
-  Discord, or model-call probe.
+  child process spawned, survived its startup grace period, and has not exited;
+  it is not an end-to-end Telegram, Discord, or model-call probe. Any unexpected
+  child exit—including a clean code-0 exit—fails the container.
 
 ## Important limitation
 
@@ -150,9 +153,12 @@ Letta's public custom-channel documentation currently describes CLI channels
 as a **local-backend** feature. This package follows the already-working
 advanced pattern of running a signed-in Letta listener on Railway against a
 cloud-hosted agent. Treat that as community infrastructure, not a first-party
-supported Letta Cloud integration. Pinning `@letta-ai/letta-code@0.32.12`
-prevents silent listener changes; upgrades require a full Telegram → agent →
-Telegram and Discord → agent → Discord regression test.
+supported Letta Cloud integration. The image installs a vendored, checksummed
+custom `@letta-ai/letta-code@0.34.24` package containing the production approval
+queue recovery repair. Its exact upstream source, patch, artifact hashes,
+shrinkwrap, and Apache-2.0 license are preserved under `vendor/letta-code/`.
+Upgrades require a full Telegram → agent → Telegram and Discord → agent →
+Discord regression test.
 
 ## Validation sequence
 
@@ -167,5 +173,11 @@ After both Railway services are healthy:
 4. If using more than one Discord channel, repeat a rapid two-channel switch
    and verify every reply stays with its source.
 5. Confirm native Discord typing appears while the agent is processing.
+6. Send one small addressed PNG/JPEG/GIF/WebP attachment and confirm it reaches
+   the agent, while a non-Discord URL or oversized file is rejected.
+7. Trigger an action that waits for approval, approve it, and confirm the same
+   waiting turn continues rather than becoming stranded.
+8. Restart `discord-bridge`, repeat Telegram and Discord, then restart
+   `continuity-listener` and repeat them again.
 
-Do not describe the deployment as complete until all five legs pass.
+Do not describe the deployment as complete until all eight legs pass.

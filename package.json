@@ -1,6 +1,6 @@
 {
   "name": "letta-continuity-relay",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A secure Railway relay connecting Telegram and Discord to one existing Letta agent conversation.",
   "type": "module",
   "main": "build/index.js",
@@ -40,7 +40,7 @@
     "dotenv": "^16.4.7",
     "express": "^5.2.1",
     "ffmpeg-static": "^5.2.0",
-    "zod": "^3.25.0"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",

@@ -18,7 +18,7 @@ export function createProactiveTelegramTool(config, fetchImpl = globalThis.fetch
   return {
     name: "proactive_telegram_send",
     description:
-      "Deliberately send Marta a brief private Telegram update from another routed context. Use for genuine context or safety updates, not obligatory surveillance or mirrored conversation. Ordinary replies must use MessageChannel and remain pinned to their source.",
+      "Deliberately send a brief private Telegram update to the configured chat from another routed context. Use for genuine context or safety updates, not obligatory surveillance or mirrored conversation. Ordinary replies must use MessageChannel and remain pinned to their source.",
     parameters: {
       type: "object",
       properties: {
@@ -26,7 +26,7 @@ export function createProactiveTelegramTool(config, fetchImpl = globalThis.fetch
           type: "string",
           minLength: 1,
           maxLength: 4096,
-          description: "Private update for Marta. The destination is fixed by listener configuration.",
+          description: "Private update for the configured chat. The destination is fixed by listener configuration.",
         },
       },
       required: ["message"],
@@ -80,7 +80,7 @@ export function createProactiveTelegramTool(config, fetchImpl = globalThis.fetch
           content: "Proactive Telegram returned an invalid receipt; delivery status is unknown, so do not repeat it automatically",
         };
       }
-      return `Private Telegram update sent to Marta (message_id: ${body.result.message_id})`;
+      return `Private Telegram update sent to the configured chat (message_id: ${body.result.message_id})`;
     },
   };
 }

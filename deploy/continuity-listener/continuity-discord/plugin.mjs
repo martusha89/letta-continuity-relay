@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -21,6 +22,16 @@ const BOT_REPLY_LEDGER_LIMIT = 4096;
 const LEDGER_LOCK_STALE_MS = 30_000;
 const LEDGER_LOCK_WAIT_MS = 5_000;
 const LEDGER_SLEEP = new Int32Array(new SharedArrayBuffer(4));
+const DISCORD_ATTACHMENT_DOWNLOAD_TIMEOUT_MS = 15_000;
+const MAX_DISCORD_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+const MAX_DISCORD_ATTACHMENT_TOTAL_BYTES = 20 * 1024 * 1024;
+const MAX_DISCORD_INLINE_IMAGE_BYTES = 5 * 1024 * 1024;
+const DISCORD_ATTACHMENTS_DIR = path.join(
+  os.tmpdir(),
+  `letta-continuity-discord-attachments-${process.pid}-${crypto.randomUUID()}`,
+);
+const DISCORD_ATTACHMENT_HOSTS = new Set(["cdn.discordapp.com", "media.discordapp.net"]);
+const preparedAttachmentDirectories = new Map();
 
 function safeLedgerFile(file) {
   try {
@@ -575,6 +586,226 @@ function cleanLabel(value, fallback) {
   return value.replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 160);
 }
 
+function attachmentKind(contentType) {
+  if (typeof contentType !== "string") return "file";
+  if (contentType.startsWith("image/")) return "image";
+  if (contentType.startsWith("audio/")) return "audio";
+  if (contentType.startsWith("video/")) return "video";
+  return "file";
+}
+
+function safeAttachmentPathSegment(value, fallback = "attachment") {
+  if (typeof value !== "string") return fallback;
+  const cleaned = value.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^_+|_+$/g, "");
+  return cleaned || fallback;
+}
+
+function normalizeMimeType(value) {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.split(";", 1)[0].trim().toLowerCase();
+  if (!normalized || /[\u0000-\u001f\u007f]/.test(normalized)) return undefined;
+  return normalized === "image/jpg" ? "image/jpeg" : normalized;
+}
+
+function detectInlineImageMime(buffer) {
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return "image/jpeg";
+  if (buffer.length >= 6 && (buffer.subarray(0, 6).toString("ascii") === "GIF87a" || buffer.subarray(0, 6).toString("ascii") === "GIF89a")) return "image/gif";
+  if (buffer.length >= 12 && buffer.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
+  return undefined;
+}
+
+async function prepareAttachmentDirectory(baseDir) {
+  if (!preparedAttachmentDirectories.has(baseDir)) {
+    preparedAttachmentDirectories.set(baseDir, (async () => {
+      fs.mkdirSync(baseDir, { recursive: true, mode: 0o700 });
+      const metadata = await fs.promises.lstat(baseDir);
+      if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error("Attachment directory must be a real directory");
+      await fs.promises.chmod(baseDir, 0o700);
+    })());
+  }
+  try {
+    await preparedAttachmentDirectories.get(baseDir);
+  } catch (error) {
+    preparedAttachmentDirectories.delete(baseDir);
+    throw error;
+  }
+}
+
+function validatedDiscordAttachmentUrl(rawUrl, allowedHosts = DISCORD_ATTACHMENT_HOSTS) {
+  if (typeof rawUrl !== "string" || rawUrl.length === 0) return null;
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol !== "https:" || url.username || url.password || url.port) return null;
+    if (!allowedHosts.has(url.hostname.toLowerCase()) || !url.pathname.startsWith("/attachments/")) return null;
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+async function writeAttachmentBody(response, localPath, maxBytes) {
+  const declared = response.headers.get("content-length");
+  if (declared && (!/^\d+$/.test(declared) || Number(declared) > maxBytes)) {
+    const error = new Error("Attachment exceeds configured byte limit");
+    error.code = "ATTACHMENT_TOO_LARGE";
+    throw error;
+  }
+  if (!response.body) throw new Error("Attachment response had no body");
+  const reader = response.body.getReader();
+  const output = await fs.promises.open(localPath, "wx", 0o600);
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        const error = new Error("Attachment exceeds configured byte limit");
+        error.code = "ATTACHMENT_TOO_LARGE";
+        error.downloadedBytes = total;
+        throw error;
+      }
+      await output.write(value);
+    }
+  } catch (error) {
+    await output.close().catch(() => {});
+    await fs.promises.rm(localPath, { force: true }).catch(() => {});
+    throw error;
+  }
+  await output.close();
+  if (total === 0) throw new Error("Attachment response was empty");
+  return total;
+}
+
+async function readAttachmentPrefix(localPath, length = 16) {
+  const input = await fs.promises.open(localPath, "r");
+  try {
+    const buffer = Buffer.alloc(length);
+    const { bytesRead } = await input.read(buffer, 0, length, 0);
+    return buffer.subarray(0, bytesRead);
+  } finally {
+    await input.close();
+  }
+}
+
+/** Download trusted Discord attachments into Letta's native channel shape. */
+export async function materializeBridgeAttachments(rawAttachments, options = {}) {
+  if (!Array.isArray(rawAttachments) || rawAttachments.length === 0) return [];
+  const fetchImpl = options.fetchImpl ?? fetch;
+  const logger = typeof options.logger === "function" ? options.logger : () => {};
+  const allowedHosts = options.allowedHosts ?? DISCORD_ATTACHMENT_HOSTS;
+  const baseDir = options.baseDir ?? DISCORD_ATTACHMENTS_DIR;
+  const maxItemBytes = options.maxItemBytes ?? MAX_DISCORD_ATTACHMENT_BYTES;
+  const maxTotalBytes = options.maxTotalBytes ?? MAX_DISCORD_ATTACHMENT_TOTAL_BYTES;
+  const maxInlineImageBytes = options.maxInlineImageBytes ?? MAX_DISCORD_INLINE_IMAGE_BYTES;
+  const sourceMessageId = typeof options.sourceMessageId === "string" ? options.sourceMessageId : undefined;
+  const sourceThreadId = typeof options.sourceThreadId === "string" ? options.sourceThreadId : undefined;
+  await prepareAttachmentDirectory(baseDir);
+  const results = [];
+  let downloadedBytes = 0;
+
+  for (const item of rawAttachments.slice(0, 10)) {
+    const id = cleanLabel(item?.id, "attachment");
+    const name = cleanLabel(item?.name, `attachment-${id}`);
+    const declaredMimeType = normalizeMimeType(item?.contentType);
+    const sizeBytes = Number.isInteger(item?.size) && item.size >= 0 ? item.size : undefined;
+    const base = {
+      id,
+      name,
+      mimeType: declaredMimeType,
+      sizeBytes,
+      kind: attachmentKind(declaredMimeType),
+      ...(sourceMessageId ? { sourceMessageId } : {}),
+      ...(sourceThreadId ? { sourceThreadId } : {}),
+    };
+    const remaining = maxTotalBytes - downloadedBytes;
+
+    if ((sizeBytes !== undefined && sizeBytes > maxItemBytes) || remaining <= 0 ||
+        (sizeBytes !== undefined && sizeBytes > remaining)) {
+      results.push({ ...base, downloadReason: "exceeds_auto_download_limit", autoDownloadLimitBytes: Math.min(maxItemBytes, Math.max(0, remaining)) });
+      continue;
+    }
+
+    const url = validatedDiscordAttachmentUrl(item?.url, allowedHosts);
+    if (!url) {
+      results.push({ ...base, downloadReason: "missing_download_url" });
+      continue;
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? DISCORD_ATTACHMENT_DOWNLOAD_TIMEOUT_MS);
+    timeout.unref?.();
+    let localPath;
+    try {
+      const response = await fetchImpl(url, { signal: controller.signal, redirect: "manual" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const localName = [Date.now(), crypto.randomUUID(), safeAttachmentPathSegment(id), safeAttachmentPathSegment(name)].join("-");
+      localPath = path.join(baseDir, localName);
+      const actualSizeBytes = await writeAttachmentBody(response, localPath, Math.min(maxItemBytes, remaining));
+      downloadedBytes += actualSizeBytes;
+      const responseMimeType = normalizeMimeType(response.headers.get("content-type"));
+      const detectedImageMime = detectInlineImageMime(await readAttachmentPrefix(localPath));
+      const compatibleMime = candidate =>
+        candidate === undefined || candidate === "application/octet-stream" || candidate === detectedImageMime;
+      const verifiedImageMime = detectedImageMime &&
+        compatibleMime(declaredMimeType) &&
+        compatibleMime(responseMimeType)
+        ? detectedImageMime
+        : undefined;
+      if (!verifiedImageMime) {
+        await fs.promises.rm(localPath, { force: true });
+        localPath = undefined;
+        results.push({
+          ...base,
+          mimeType: "application/octet-stream",
+          sizeBytes: actualSizeBytes,
+          kind: "file",
+          downloadReason: "unsupported_attachment_type",
+        });
+        continue;
+      }
+      results.push({
+        ...base,
+        mimeType: verifiedImageMime,
+        sizeBytes: actualSizeBytes,
+        kind: "image",
+        localPath,
+        ...(actualSizeBytes <= maxInlineImageBytes
+          ? { imageDataBase64: (await fs.promises.readFile(localPath)).toString("base64") }
+          : {}),
+      });
+    } catch (error) {
+      if (localPath) await fs.promises.rm(localPath, { force: true }).catch(() => {});
+      const tooLarge = error?.code === "ATTACHMENT_TOO_LARGE";
+      if (tooLarge && Number.isSafeInteger(error.downloadedBytes) && error.downloadedBytes > 0) {
+        downloadedBytes = Math.min(maxTotalBytes, downloadedBytes + error.downloadedBytes);
+      }
+      logger(`${LOG_PREFIX} attachment ${name} could not be materialized: ${tooLarge ? "size limit" : "download failed"}`);
+      results.push({
+        ...base,
+        downloadReason: tooLarge ? "exceeds_auto_download_limit" : "download_failed",
+        ...(tooLarge ? { autoDownloadLimitBytes: Math.min(maxItemBytes, Math.max(0, remaining)) } : {}),
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  return results;
+}
+
+async function cleanupMaterializedAttachments(attachments, logger = () => {}) {
+  await Promise.all((attachments ?? []).map(async attachment => {
+    if (typeof attachment?.localPath !== "string") return;
+    try {
+      await fs.promises.rm(attachment.localPath, { force: true });
+    } catch {
+      logger(`${LOG_PREFIX} could not remove a materialized attachment`);
+    }
+  }));
+}
+
 function attachmentNote(attachments) {
   if (!Array.isArray(attachments) || attachments.length === 0) return "";
   const lines = attachments.slice(0, 10).map(item => {
@@ -943,7 +1174,16 @@ export function createContinuityDiscordAdapter(account, options = {}) {
     entry.promise = (async () => {
       try {
         if (typeof adapter.onMessage !== "function") throw new Error("Discord bridge route handler is unavailable");
-        await adapter.onMessage(inbound);
+        const attachments = await materializeBridgeAttachments(event.message.attachments, {
+          logger: startupLogger,
+          sourceMessageId: event.message.messageId,
+          sourceThreadId: event.message.threadId ?? undefined,
+        });
+        try {
+          await adapter.onMessage({ ...inbound, attachments });
+        } finally {
+          await cleanupMaterializedAttachments(attachments, startupLogger);
+        }
         entry.accepted = true;
         // A stopped generation may finish much later. It must never ACK a
         // sequence that a newer bridge generation may have reused.

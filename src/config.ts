@@ -114,6 +114,8 @@ export interface BridgeConfig {
   dmUserIds: string[];
   /** Optional inbound-only channel/thread fence, narrower than the shared MCP policy. */
   channelIds: string[];
+  /** Explicitly trusted guilds where allowed channels deliver every non-webhook, non-system message. */
+  allMessageGuildIds: string[];
   /** Guild roles whose mention deliberately addresses the bot. */
   roleIds: string[];
   /** Minimum interval between accepted messages from one bot in one channel/thread. */
@@ -300,6 +302,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig 
   const bridgeBearerToken = env.DISCORD_BRIDGE_BEARER_TOKEN?.trim() || null;
   const bridgeDmUserIds = parseSnowflakeList("DISCORD_BRIDGE_DM_USER_IDS", env.DISCORD_BRIDGE_DM_USER_IDS, []);
   const bridgeChannelIds = parseSnowflakeList("DISCORD_BRIDGE_CHANNEL_IDS", env.DISCORD_BRIDGE_CHANNEL_IDS, []);
+  const bridgeAllMessageGuildIds = parseSnowflakeList(
+    "DISCORD_BRIDGE_ALL_MESSAGE_GUILD_IDS",
+    env.DISCORD_BRIDGE_ALL_MESSAGE_GUILD_IDS,
+    [],
+  );
   const bridgeRoleIds = parseSnowflakeList("DISCORD_BRIDGE_ROLE_IDS", env.DISCORD_BRIDGE_ROLE_IDS, []);
   const bridgeAllowEveryone = parseBoolean("DISCORD_BRIDGE_ALLOW_EVERYONE", env.DISCORD_BRIDGE_ALLOW_EVERYONE, false);
   if (bridgeEnabled) {
@@ -321,6 +328,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig 
     bearerToken: bridgeBearerToken,
     dmUserIds: bridgeDmUserIds,
     channelIds: bridgeChannelIds,
+    allMessageGuildIds: bridgeAllMessageGuildIds,
     roleIds: bridgeRoleIds,
     botCooldownMs: parseInteger(
       "DISCORD_BRIDGE_BOT_COOLDOWN_MS",

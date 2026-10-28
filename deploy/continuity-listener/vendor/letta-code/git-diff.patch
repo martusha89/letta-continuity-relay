@@ -1,0 +1,1140 @@
+diff --git a/src/websocket/helpers/listener-queue-adapter.ts b/src/websocket/helpers/listener-queue-adapter.ts
+index 71c8a022a..8fb592b26 100644
+--- a/src/websocket/helpers/listener-queue-adapter.ts
++++ b/src/websocket/helpers/listener-queue-adapter.ts
+@@ -4,6 +4,7 @@ import type { TurnLifecycleSnapshot } from "@/websocket/listener/turn-lifecycle"
+ export function getListenerBlockedReason(
+   lifecycle: TurnLifecycleSnapshot,
+   pendingApprovalsLen: number,
++  approvalRecoveryDeferred = false,
+ ): QueueBlockedReason | null {
+   if (lifecycle.kind === "cancelling") {
+     return "interrupt_in_progress";
+@@ -11,6 +12,9 @@ export function getListenerBlockedReason(
+   if (pendingApprovalsLen > 0) {
+     return "pending_approvals";
+   }
++  if (approvalRecoveryDeferred) {
++    return "runtime_busy";
++  }
+   if (lifecycle.kind === "command") {
+     return "command_running";
+   }
+diff --git a/src/websocket/listener-queue-adapter.test.ts b/src/websocket/listener-queue-adapter.test.ts
+index de0e2559e..524fcd290 100644
+--- a/src/websocket/listener-queue-adapter.test.ts
++++ b/src/websocket/listener-queue-adapter.test.ts
+@@ -19,6 +19,13 @@ describe("getListenerBlockedReason", () => {
+     );
+   });
+ 
++  test("maps ownership-deferred approval recovery to runtime busy", () => {
++    const lifecycle = createLifecycle();
++    expect(getListenerBlockedReason(lifecycle.snapshot(), 0, true)).toBe(
++      "runtime_busy",
++    );
++  });
++
+   test("prioritizes cancellation over pending approvals", () => {
+     const lifecycle = createLifecycle();
+     lifecycle.begin({
+diff --git a/src/websocket/listener/commands/runtime-start.ts b/src/websocket/listener/commands/runtime-start.ts
+index dc1047c16..cd5dcd76f 100644
+--- a/src/websocket/listener/commands/runtime-start.ts
++++ b/src/websocket/listener/commands/runtime-start.ts
+@@ -58,6 +58,7 @@ type ReplaySyncStateForRuntime = (
+     recoverApprovals?: boolean;
+     forceDeviceStatus?: boolean;
+     connectionId?: string;
++    onDeferredRecoverySettled?: () => void;
+   },
+ ) => Promise<void>;
+ 
+@@ -461,6 +462,21 @@ export async function handleRuntimeStartCommand(
+   let scopedRuntime: ConversationRuntime | null = null;
+   let shouldReplayState = false;
+   let startResponseSent = false;
++  const scheduleScopedQueuePump = (): void => {
++    if (
++      startResponseSent &&
++      scopedRuntime?.queueRuntime?.isEmpty === false &&
++      context.queuePumpOptions &&
++      context.processQueuedTurn
++    ) {
++      scheduleQueuePump(
++        scopedRuntime,
++        getOrCreateProcessTransport(context.runtime),
++        context.queuePumpOptions,
++        context.processQueuedTurn,
++      );
++    }
++  };
+ 
+   try {
+     validateRuntimeStartShape(parsed);
+@@ -522,6 +538,7 @@ export async function handleRuntimeStartCommand(
+           recoverApprovals: parsed.recover_approvals !== false,
+           forceDeviceStatus: parsed.force_device_status !== false,
+           connectionId,
++          onDeferredRecoverySettled: scheduleScopedQueuePump,
+         },
+       );
+     }
+@@ -553,6 +570,7 @@ export async function handleRuntimeStartCommand(
+         recoverApprovals: parsed.recover_approvals !== false,
+         forceDeviceStatus: parsed.force_device_status !== false,
+         connectionId: context.connectionId,
++        onDeferredRecoverySettled: scheduleScopedQueuePump,
+       },
+     );
+   }
+@@ -560,19 +578,7 @@ export async function handleRuntimeStartCommand(
+   // Startup can attempt the queue before a new connection has subscribed.
+   // Retry after this scope's initial replay so accepted work cannot interleave
+   // with approval recovery or execute after a failed runtime_start.
+-  if (
+-    startResponseSent &&
+-    scopedRuntime?.queueRuntime?.isEmpty === false &&
+-    context.queuePumpOptions &&
+-    context.processQueuedTurn
+-  ) {
+-    scheduleQueuePump(
+-      scopedRuntime,
+-      getOrCreateProcessTransport(context.runtime),
+-      context.queuePumpOptions,
+-      context.processQueuedTurn,
+-    );
+-  }
++  scheduleScopedQueuePump();
+ 
+   return true;
+ }
+diff --git a/src/websocket/listener/input-admission.test.ts b/src/websocket/listener/input-admission.test.ts
+index eaa069e5f..84ebcb44f 100644
+--- a/src/websocket/listener/input-admission.test.ts
++++ b/src/websocket/listener/input-admission.test.ts
+@@ -3,6 +3,7 @@ import type WebSocket from "ws";
+ import {
+   markListenerConnectionInitialized,
+   openListenerConnection,
++  subscribeListenerConnection,
+ } from "./connection";
+ import {
+   getOrCreateScopedRuntime,
+@@ -17,12 +18,15 @@ import {
+ } from "./input-disposition";
+ import { createRuntime } from "./lifecycle";
+ import { createListenerMessageHandler } from "./message-router";
+-import { setActiveRuntime } from "./runtime";
++import { scheduleQueuePump } from "./queue";
++import { clearRecoveredApprovalState, setActiveRuntime } from "./runtime";
++import { replaySyncStateForRuntime } from "./sync-replay";
+ import type {
+   ConversationRuntime,
+   IncomingMessage,
+   ListenerRuntime,
+   PendingTeleport,
++  ProcessQueuedTurn,
+   StartListenerOptions,
+ } from "./types";
+ 
+@@ -115,6 +119,7 @@ function setupRouter(params: {
+     context: string,
+   ) => void;
+   processIncomingMessage: (incoming: IncomingMessage) => Promise<void>;
++  processQueuedTurn?: ProcessQueuedTurn;
+ }): (data: WebSocket.RawData) => Promise<void> {
+   const options = makeOptions();
+   const connection = openListenerConnection({
+@@ -133,7 +138,7 @@ function setupRouter(params: {
+     runtime: params.listener,
+     socket: socket as unknown as WebSocket,
+     opts: options,
+-    processQueuedTurn: async () => {},
++    processQueuedTurn: params.processQueuedTurn ?? (async () => {}),
+     fileCommandSession: { handle: () => false },
+     getParsedRuntimeScope: () => null,
+     replaySyncStateForRuntime: async () => {},
+@@ -194,6 +199,123 @@ function teleportContinueFrame(requestId: string, teleportId: string): Buffer {
+ 
+ afterEach(() => setActiveRuntime(null));
+ 
++test("ownership-deferred recovery durably queues input until recovery settles", async () => {
++  const listener = createRuntime();
++  const runtime = getOrCreateScopedRuntime(
++    listener,
++    "agent-1",
++    "conversation-1",
++  );
++  const sent: unknown[] = [];
++  const tasks: Promise<void>[] = [];
++  const options = makeOptions();
++  const processQueuedTurn = mock(async () => {});
++  const handleMessage = setupRouter({
++    listener,
++    runtime,
++    sent,
++    tasks,
++    trackListenerError: () => {},
++    processIncomingMessage: async () => {},
++    processQueuedTurn,
++  });
++  subscribeListenerConnection(listener, options.connectionId, {
++    agent_id: "agent-1",
++    conversation_id: "conversation-1",
++  });
++  let backendApprovalPending = true;
++  let retryRecovery: (() => Promise<boolean>) | undefined;
++
++  await replaySyncStateForRuntime(
++    listener,
++    socket as unknown as WebSocket,
++    { agent_id: "agent-1", conversation_id: "conversation-1" },
++    {
++      recoverApprovals: true,
++      scheduleWarmupsAfterSync: () => {},
++      recoverApprovalStateForSync: async (scopedRuntime) => {
++        if (!backendApprovalPending) return undefined;
++        // The real conflict path clears a stale recovered cache. That clear
++        // used to evict the still-idle scoped runtime before sync could record
++        // that ownership recovery was deferred.
++        clearRecoveredApprovalState(scopedRuntime);
++        return "deferred";
++      },
++      scheduleDeferredRecovery: (_scopedRuntime, retry) => {
++        retryRecovery = retry;
++      },
++      onDeferredRecoverySettled: () =>
++        scheduleQueuePump(runtime, socket as never, options, processQueuedTurn),
++    },
++  );
++
++  expect(runtime.approvalRecoveryDeferred).toBe(true);
++  expect(listener.conversationRuntimes.get(runtime.key)).toBe(runtime);
++  await handleMessage(createMessageFrame("during-approval", "cm-deferred"));
++  await Bun.sleep(1);
++
++  expect(backendApprovalPending).toBe(true);
++  expect(sent).toContainEqual(
++    expect.objectContaining({
++      request_id: "during-approval",
++      accepted: true,
++      disposition: "queued",
++    }),
++  );
++  expect(runtime.queueRuntime.length).toBe(1);
++  expect(processQueuedTurn).not.toHaveBeenCalled();
++
++  backendApprovalPending = false;
++  expect(retryRecovery).toBeDefined();
++  expect(await retryRecovery?.()).toBe(true);
++  for (
++    let attempt = 0;
++    processQueuedTurn.mock.calls.length === 0 && attempt < 100;
++    attempt += 1
++  ) {
++    await Bun.sleep(1);
++  }
++
++  expect(runtime.approvalRecoveryDeferred).toBe(false);
++  expect(runtime.queueRuntime.length).toBe(0);
++  expect(processQueuedTurn).toHaveBeenCalledTimes(1);
++});
++
++test("the queue cannot overtake a recovered approval awaiting continuation", async () => {
++  const listener = createRuntime();
++  const runtime = getOrCreateScopedRuntime(
++    listener,
++    "agent-1",
++    "conversation-1",
++  );
++  setActiveRuntime(listener);
++  runtime.recoveredApprovalState = {
++    agentId: "agent-1",
++    conversationId: "conversation-1",
++    autoDecisions: [],
++    allApprovals: [
++      {
++        toolCallId: "call-recovered",
++        toolName: "ExampleTool",
++        toolArgs: "{}",
++      },
++    ],
++  };
++  parkQueueItem(runtime, "do not overtake the approval");
++  const processQueuedTurn = mock(async () => {});
++
++  scheduleQueuePump(
++    runtime,
++    socket as unknown as WebSocket,
++    makeOptions(),
++    processQueuedTurn,
++  );
++  await Bun.sleep(5);
++
++  expect(processQueuedTurn).not.toHaveBeenCalled();
++  expect(runtime.queueRuntime.length).toBe(1);
++});
++
+ test("direct started input remains refill-suppressed until turn ownership", async () => {
+   const listener = createRuntime();
+   const runtime = getOrCreateScopedRuntime(
+diff --git a/src/websocket/listener/message-router.test.ts b/src/websocket/listener/message-router.test.ts
+index 23b5adc4f..87686358b 100644
+--- a/src/websocket/listener/message-router.test.ts
++++ b/src/websocket/listener/message-router.test.ts
+@@ -193,6 +193,83 @@ describe("listener message router ownership handoff", () => {
+     }
+   });
+ 
++  test("sync acknowledgement precedes queue work after recovery settles", async () => {
++    const listener = createRuntime();
++    const runtime = getOrCreateScopedRuntime(listener, "agent-1", "conv-1");
++    const socket = new MockSocket();
++    initializeMockConnection(listener, socket);
++    const opts = makeListenerOptions();
++    const events: string[] = [];
++    setActiveRuntime(listener);
++    expect(
++      enqueueInboundUserMessage(runtime, {
++        type: "message",
++        agentId: "agent-1",
++        conversationId: "conv-1",
++        messages: [
++          {
++            role: "user",
++            content: "wait for the sync ack",
++            client_message_id: "cm-sync-order",
++          },
++        ],
++      }),
++    ).toBe(true);
++
++    const handleMessage = createListenerMessageHandler({
++      runtime: listener,
++      socket: socket as unknown as WebSocket,
++      opts,
++      processQueuedTurn: async () => {
++        events.push("queued-turn");
++      },
++      fileCommandSession: { handle: () => false },
++      getParsedRuntimeScope: () => null,
++      replaySyncStateForRuntime: async (
++        _runtime,
++        _socket,
++        _scope,
++        replayOpts,
++      ) => {
++        replayOpts?.onDeferredRecoverySettled?.();
++      },
++      getOrCreateScopedRuntime: () => runtime,
++      handleApprovalResponseInput: async () => false,
++      handleChangeDeviceStateInput: async () => false,
++      handleAbortMessageInput: async () => false,
++      stampInboundUserMessageOtids: (incoming) => incoming,
++      safeSocketSend: (_target, payload) => {
++        if (
++          typeof payload === "object" &&
++          payload !== null &&
++          "type" in payload &&
++          payload.type === "sync_response"
++        ) {
++          events.push("sync-response");
++        }
++        return true;
++      },
++      runDetachedListenerTask: () => {},
++      trackListenerError: (error) => {
++        throw error;
++      },
++      processIncomingMessage: async () => {},
++    });
++
++    await handleMessage(
++      Buffer.from(
++        JSON.stringify({
++          type: "sync",
++          request_id: "sync-order",
++          runtime: { agent_id: "agent-1", conversation_id: "conv-1" },
++        }),
++      ),
++    );
++    await waitFor(() => events.includes("queued-turn"));
++
++    expect(events).toEqual(["sync-response", "queued-turn"]);
++  });
++
+   test("acknowledges batched external-tool registration without runtime startup", async () => {
+     const listener = createRuntime();
+     const runtime = getOrCreateScopedRuntime(listener, "agent-1", "conv-1");
+diff --git a/src/websocket/listener/message-router.ts b/src/websocket/listener/message-router.ts
+index 44fc4feae..187179035 100644
+--- a/src/websocket/listener/message-router.ts
++++ b/src/websocket/listener/message-router.ts
+@@ -51,6 +51,7 @@ import {
+ } from "./protocol-inbound";
+ import { logV2Command, summarizeV2Command } from "./protocol-logging";
+ import { emitDeviceStatusUpdate } from "./protocol-outbound";
++import { scheduleQueuePump } from "./queue";
+ import { emitLoopErrorNotice } from "./recoverable-notices";
+ import { getActiveRuntime, safeEmitWsEvent } from "./runtime";
+ import { parseListenerReadyMessage } from "./split-stream-lifecycle";
+@@ -262,12 +263,33 @@ export function createListenerMessageHandler(
+           return;
+         }
+         try {
++          let syncResponseSent = false;
++          let queueResumeRequested = false;
++          const syncScopedRuntime = getOrCreateScopedRuntime(
++            runtime,
++            parsed.runtime.agent_id,
++            parsed.runtime.conversation_id,
++          );
++          const resumeScopedQueue = (): void => {
++            if (!syncResponseSent) {
++              queueResumeRequested = true;
++              return;
++            }
++            if (syncScopedRuntime.queueRuntime.isEmpty) return;
++            scheduleQueuePump(
++              syncScopedRuntime,
++              socket,
++              opts,
++              processQueuedTurn,
++            );
++          };
+           await replaySyncStateForRuntime(runtime, socket, parsed.runtime, {
+             recoverApprovals: parsed.recover_approvals !== false,
+             resumeInterruptedTurn: parsed.resume_interrupted_turn === true,
+             forceDeviceStatus: parsed.force_device_status === true,
+             onStatusChange: opts.onStatusChange,
+             connectionId: opts.connectionId,
++            onDeferredRecoverySettled: resumeScopedQueue,
+           });
+           if (parsed.request_id) {
+             safeSocketSend(
+@@ -282,6 +304,8 @@ export function createListenerMessageHandler(
+               "sync",
+             );
+           }
++          syncResponseSent = true;
++          if (queueResumeRequested) resumeScopedQueue();
+         } catch (error) {
+           if (parsed.request_id) {
+             safeSocketSend(
+diff --git a/src/websocket/listener/protocol-ergonomics.test.ts b/src/websocket/listener/protocol-ergonomics.test.ts
+index 05940a90c..9f81c523c 100644
+--- a/src/websocket/listener/protocol-ergonomics.test.ts
++++ b/src/websocket/listener/protocol-ergonomics.test.ts
+@@ -13,6 +13,7 @@ import {
+   markListenerConnectionInitialized,
+   openListenerConnection,
+ } from "@/websocket/listener/connection";
++import { getOrCreateScopedRuntime } from "@/websocket/listener/conversation-runtime";
+ import { createListenerMessageHandler } from "@/websocket/listener/message-router";
+ import { parseServerMessage } from "@/websocket/listener/protocol-inbound";
+ import { resetRemoteSettingsCache } from "@/websocket/listener/remote-settings";
+@@ -123,9 +124,17 @@ describe("listener protocol ergonomics", () => {
+     const runtime = __listenClientTestUtils.createListenerRuntime();
+     const sent: unknown[] = [];
+     const replaySyncStateForRuntime = mock(async () => {});
++    const scopedRuntime = getOrCreateScopedRuntime(
++      runtime,
++      "agent-1",
++      "default",
++    );
+     __listenClientTestUtils.setActiveRuntime(runtime);
+ 
+-    await makeHandler(runtime, sent, { replaySyncStateForRuntime })(
++    await makeHandler(runtime, sent, {
++      replaySyncStateForRuntime,
++      getOrCreateScopedRuntime: () => scopedRuntime,
++    })(
+       Buffer.from(
+         JSON.stringify({
+           type: "sync",
+@@ -141,13 +150,14 @@ describe("listener protocol ergonomics", () => {
+       runtime,
+       expect.anything(),
+       { agent_id: "agent-1", conversation_id: "default" },
+-      {
++      expect.objectContaining({
+         recoverApprovals: false,
+         resumeInterruptedTurn: false,
+         forceDeviceStatus: true,
+         onStatusChange: undefined,
+         connectionId: "conn-test",
+-      },
++        onDeferredRecoverySettled: expect.any(Function),
++      }),
+     );
+     expect(sent).toContainEqual({
+       type: "sync_response",
+diff --git a/src/websocket/listener/queue.ts b/src/websocket/listener/queue.ts
+index b688df0ec..3353b3ed8 100644
+--- a/src/websocket/listener/queue.ts
++++ b/src/websocket/listener/queue.ts
+@@ -286,6 +286,7 @@ export function shouldProcessInboundMessageDirectly(
+       activeScope
+         ? getPendingControlRequestCount(runtime.listener, activeScope)
+         : 0,
++      runtime.approvalRecoveryDeferred,
+     ) === null
+   );
+ }
+@@ -434,6 +435,10 @@ export function consumeQueuedTurn(runtime: ConversationRuntime): {
+ function computeListenerQueueBlockedReason(
+   runtime: ConversationRuntime,
+ ): QueueBlockedReason | null {
++  // Recovery discovered a real approval batch but has not yet established its
++  // continuation lease (or is waiting for a fresh human decision). Do not let
++  // the ordinary queue consume that conversation first.
++  if (runtime.recoveredApprovalState !== null) return "pending_approvals";
+   const activeScope = resolveRuntimeScope(runtime.listener, {
+     agent_id: runtime.agentId,
+     conversation_id: runtime.conversationId,
+@@ -443,6 +448,7 @@ function computeListenerQueueBlockedReason(
+     activeScope
+       ? getPendingControlRequestCount(runtime.listener, activeScope)
+       : 0,
++    runtime.approvalRecoveryDeferred,
+   );
+ }
+ 
+diff --git a/src/websocket/listener/recovery-sync.test.ts b/src/websocket/listener/recovery-sync.test.ts
+index 5e50917f2..9c3d31d15 100644
+--- a/src/websocket/listener/recovery-sync.test.ts
++++ b/src/websocket/listener/recovery-sync.test.ts
+@@ -114,6 +114,25 @@ function connectRuntime(runtime: ConversationRuntime): MockTransport {
+ }
+ 
+ describe("recoverApprovalStateForSync restart recovery", () => {
++  test("a local approval wait keeps ownership recovery deferred", async () => {
++    const runtime = createScopedRuntime();
++    const lease = runtime.turnLifecycle.begin({
++      origin: "message",
++      workingDirectory: process.cwd(),
++      initialStatus: "WAITING_ON_APPROVAL",
++    });
++
++    expect(
++      await recoverApprovalStateForSync(
++        runtime,
++        scope,
++        createDeps([bashApproval]),
++      ),
++    ).toBe("deferred");
++
++    runtime.turnLifecycle.finish(lease, "end_turn");
++  });
++
+   test("sync does not revive a legacy question as a control request", async () => {
+     const runtime = createScopedRuntime();
+     const transport = connectRuntime(runtime);
+diff --git a/src/websocket/listener/recovery-sync.ts b/src/websocket/listener/recovery-sync.ts
+index 6e814fe02..3d44f9a28 100644
+--- a/src/websocket/listener/recovery-sync.ts
++++ b/src/websocket/listener/recovery-sync.ts
+@@ -81,12 +81,12 @@ export async function recoverApprovalStateForSync(
+ 
+   if (sameActiveScope && runtime.turnLifecycle.kind !== "idle") {
+     clearRecoveredApprovalState(runtime);
+-    return;
++    return "deferred";
+   }
+ 
+   if (runtime.pendingApprovalResolvers.size > 0 && sameActiveScope) {
+     clearRecoveredApprovalState(runtime);
+-    return;
++    return "deferred";
+   }
+ 
+   const initialEligibility = await getRecoveryEligibility(runtime);
+@@ -138,14 +138,16 @@ export async function recoverApprovalStateForSync(
+   // started meanwhile owns this conversation's approval state.
+   if ((await getRecoveryEligibility(runtime)) !== "owned") return "deferred";
+   if (
+-    (hasInterruptedCacheForScope(runtime.listener, scope) &&
+-      !opts.resumeInterruptedTurn) ||
+-    (sameActiveScope &&
+-      (runtime.turnLifecycle.kind !== "idle" ||
+-        runtime.pendingApprovalResolvers.size > 0))
+-  ) {
++    hasInterruptedCacheForScope(runtime.listener, scope) &&
++    !opts.resumeInterruptedTurn
++  )
+     return;
+-  }
++  if (
++    sameActiveScope &&
++    (runtime.turnLifecycle.kind !== "idle" ||
++      runtime.pendingApprovalResolvers.size > 0)
++  )
++    return "deferred";
+ 
+   const rawRecorded = resolvedDeps.readInterruptedTurn(runtime);
+   const recoverySnapshot =
+diff --git a/src/websocket/listener/runtime.ts b/src/websocket/listener/runtime.ts
+index 9959c9186..bbefa00d6 100644
+--- a/src/websocket/listener/runtime.ts
++++ b/src/websocket/listener/runtime.ts
+@@ -3,6 +3,7 @@ import { createSharedReminderState } from "@/reminders/state";
+ import type { PendingControlRequest } from "@/types/protocol_v2";
+ import { redactWsEventForLogging } from "@/websocket/ws-event-redaction";
+ import { getWorkingDirectoryScopeKey } from "./cwd";
++import { cancelDeferredSyncRecovery } from "./deferred-sync-recovery";
+ import { cancelFailedTeleportCleanup } from "./failed-teleport-cleanup";
+ import {
+   normalizeConversationId,
+@@ -209,6 +210,7 @@ export function evictConversationRuntimeIfIdle(
+     runtime.pendingApprovalResolvers.size > 0 ||
+     runtime.pendingApprovalBatchByToolCallId.size > 0 ||
+     runtime.recoveredApprovalState !== null ||
++    runtime.approvalRecoveryDeferred ||
+     runtime.pendingInterruptedResults !== null ||
+     runtime.pendingInterruptedContext !== null ||
+     (runtime.pendingInterruptedToolCallIds?.length ?? 0) > 0 ||
+@@ -312,6 +314,9 @@ export function createConversationRuntime(
+     messageQueue: Promise.resolve(),
+     pendingApprovalResolvers: new Map(),
+     recoveredApprovalState: null,
++    approvalRecoveryDeferred: false,
++    approvalRecoveryAttempt: 0,
++    approvalRecoveryEpoch: 0,
+     expectedTeleportId: null,
+     expectedTeleportExpiresAt: null,
+     get lastStopReason() {
+@@ -426,6 +431,9 @@ export function invalidateExternalToolNotifications(
+ export function clearConversationRuntimeState(
+   runtime: ConversationRuntime,
+ ): void {
++  cancelDeferredSyncRecovery(runtime);
++  runtime.approvalRecoveryAttempt += 1;
++  runtime.approvalRecoveryEpoch += 1;
+   invalidateExternalToolNotifications(runtime);
+   runtime.turnLifecycle.reset("cancelled");
+   releaseListenerTurnContext({
+@@ -435,6 +443,7 @@ export function clearConversationRuntimeState(
+   });
+   runtime.pendingApprovalBatchByToolCallId.clear();
+   runtime.approvalMessageIdByToolCallId.clear();
++  runtime.approvalRecoveryDeferred = false;
+   runtime.pendingInterruptedResults = null;
+   runtime.pendingInterruptedContext = null;
+   runtime.pendingInterruptedToolCallIds = null;
+diff --git a/src/websocket/listener/sync-replay.test.ts b/src/websocket/listener/sync-replay.test.ts
+index 96306150c..f6839d98a 100644
+--- a/src/websocket/listener/sync-replay.test.ts
++++ b/src/websocket/listener/sync-replay.test.ts
+@@ -1,4 +1,4 @@
+-import { describe, expect, test } from "bun:test";
++import { describe, expect, mock, test } from "bun:test";
+ import type { ApprovalDecision } from "@/agent/approval-execution";
+ import { clearPendingMessages } from "@/utils/message-queue-bridge";
+ import {
+@@ -9,6 +9,7 @@ import { getOrCreateScopedRuntime } from "./conversation-runtime";
+ import { createRuntime } from "./lifecycle";
+ import { startRecoveredApprovalContinuation } from "./recovery";
+ import { recoverApprovalStateForSync } from "./recovery-sync";
++import { clearConversationRuntimeState } from "./runtime";
+ import { replaySyncStateForRuntime } from "./sync-replay";
+ import {
+   claimPendingTeleportAtBoundary,
+@@ -91,6 +92,230 @@ async function waitFor(predicate: () => boolean): Promise<void> {
+   throw new Error("Timed out waiting for the recovered continuation");
+ }
+ 
++test("a replaced connection cannot clear an in-flight recovery fence", async () => {
++  const { runtime, transport } = connectRuntime();
++  runtime.listener.connectionGeneration = "generation-old";
++  let releaseRecovery!: () => void;
++  let signalRecoveryStarted!: () => void;
++  const recoveryStarted = new Promise<void>((resolve) => {
++    signalRecoveryStarted = resolve;
++  });
++  const recoveryHeld = new Promise<void>((resolve) => {
++    releaseRecovery = resolve;
++  });
++  const onSettled = mock(() => {});
++
++  const replay = replaySyncStateForRuntime(
++    runtime.listener,
++    transport as never,
++    scope,
++    {
++      recoverApprovals: true,
++      scheduleWarmupsAfterSync: () => {},
++      recoverApprovalStateForSync: async () => {
++        signalRecoveryStarted();
++        await recoveryHeld;
++      },
++      onDeferredRecoverySettled: onSettled,
++    },
++  );
++  await recoveryStarted;
++  expect(runtime.approvalRecoveryDeferred).toBe(true);
++
++  runtime.listener.connectionGeneration = "generation-new";
++  releaseRecovery();
++  await replay;
++
++  expect(runtime.approvalRecoveryDeferred).toBe(true);
++  expect(onSettled).not.toHaveBeenCalled();
++
++  await replaySyncStateForRuntime(runtime.listener, transport as never, scope, {
++    recoverApprovals: true,
++    scheduleWarmupsAfterSync: () => {},
++    recoverApprovalStateForSync: async () => {},
++    onDeferredRecoverySettled: onSettled,
++  });
++  expect(runtime.approvalRecoveryDeferred).toBe(false);
++  expect(onSettled).toHaveBeenCalledTimes(1);
++});
++
++test("an authoritative reset invalidates in-flight recovery", async () => {
++  const { runtime, transport } = connectRuntime();
++  let releaseRecovery!: () => void;
++  let signalRecoveryStarted!: () => void;
++  const recoveryStarted = new Promise<void>((resolve) => {
++    signalRecoveryStarted = resolve;
++  });
++  const recoveryHeld = new Promise<void>((resolve) => {
++    releaseRecovery = resolve;
++  });
++  const onSettled = mock(() => {});
++
++  const replay = replaySyncStateForRuntime(
++    runtime.listener,
++    transport as never,
++    scope,
++    {
++      recoverApprovals: true,
++      scheduleWarmupsAfterSync: () => {},
++      recoverApprovalStateForSync: async () => {
++        signalRecoveryStarted();
++        await recoveryHeld;
++      },
++      onDeferredRecoverySettled: onSettled,
++    },
++  );
++  await recoveryStarted;
++  expect(runtime.approvalRecoveryDeferred).toBe(true);
++
++  clearConversationRuntimeState(runtime);
++  releaseRecovery();
++  await replay;
++
++  expect(runtime.approvalRecoveryDeferred).toBe(false);
++  expect(onSettled).not.toHaveBeenCalled();
++});
++
++test("an older conclusive sync cannot clear a newer deferred fence", async () => {
++  const { runtime, transport } = connectRuntime();
++  const releases: Array<() => void> = [];
++  const starts: Array<() => void> = [];
++  const started = [
++    new Promise<void>((resolve) => starts.push(resolve)),
++    new Promise<void>((resolve) => starts.push(resolve)),
++  ];
++  const held = [
++    new Promise<void>((resolve) => releases.push(resolve)),
++    new Promise<void>((resolve) => releases.push(resolve)),
++  ];
++  let call = 0;
++  const onSettled = mock(() => {});
++  const recover = async () => {
++    const index = call++;
++    starts[index]?.();
++    await held[index];
++    return index === 0 ? undefined : ("deferred" as const);
++  };
++  const options = {
++    recoverApprovals: true,
++    scheduleWarmupsAfterSync: () => {},
++    scheduleDeferredRecovery: mock(() => {}),
++    recoverApprovalStateForSync: recover,
++    onDeferredRecoverySettled: onSettled,
++  };
++
++  const older = replaySyncStateForRuntime(
++    runtime.listener,
++    transport as never,
++    scope,
++    options,
++  );
++  await started[0];
++  const newer = replaySyncStateForRuntime(
++    runtime.listener,
++    transport as never,
++    scope,
++    options,
++  );
++  await started[1];
++  releases[1]?.();
++  await newer;
++  releases[0]?.();
++  await older;
++
++  expect(runtime.approvalRecoveryDeferred).toBe(true);
++  expect(onSettled).not.toHaveBeenCalled();
++});
++
++test("an older deferred sync cannot re-fence a newer conclusive result", async () => {
++  const { runtime, transport } = connectRuntime();
++  const releases: Array<() => void> = [];
++  const starts: Array<() => void> = [];
++  const started = [
++    new Promise<void>((resolve) => starts.push(resolve)),
++    new Promise<void>((resolve) => starts.push(resolve)),
++  ];
++  const held = [
++    new Promise<void>((resolve) => releases.push(resolve)),
++    new Promise<void>((resolve) => releases.push(resolve)),
++  ];
++  let call = 0;
++  const onSettled = mock(() => {});
++  const recover = async () => {
++    const index = call++;
++    starts[index]?.();
++    await held[index];
++    return index === 0 ? ("deferred" as const) : undefined;
++  };
++  const options = {
++    recoverApprovals: true,
++    scheduleWarmupsAfterSync: () => {},
++    scheduleDeferredRecovery: mock(() => {}),
++    recoverApprovalStateForSync: recover,
++    onDeferredRecoverySettled: onSettled,
++  };
++
++  const older = replaySyncStateForRuntime(
++    runtime.listener,
++    transport as never,
++    scope,
++    options,
++  );
++  await started[0];
++  const newer = replaySyncStateForRuntime(
++    runtime.listener,
++    transport as never,
++    scope,
++    options,
++  );
++  await started[1];
++  releases[1]?.();
++  await newer;
++  releases[0]?.();
++  await older;
++
++  expect(runtime.approvalRecoveryDeferred).toBe(false);
++  expect(onSettled).toHaveBeenCalledTimes(1);
++});
++
++test("a continuation ownership loss restores the fence before queue settlement", async () => {
++  const { runtime, transport } = connectRuntime();
++  runtime.listener.connectionGeneration = "generation-current";
++  const onSettled = mock(() => {});
++  const scheduleRetry = mock(() => {});
++
++  await replaySyncStateForRuntime(runtime.listener, transport as never, scope, {
++    recoverApprovals: true,
++    resumeInterruptedTurn: true,
++    scheduleWarmupsAfterSync: () => {},
++    scheduleDeferredRecovery: scheduleRetry,
++    recoverApprovalStateForSync: async (scopedRuntime) => {
++      scopedRuntime.recoveredApprovalState = {
++        agentId: scope.agent_id,
++        conversationId: scope.conversation_id,
++        autoDecisions: [
++          {
++            type: "deny",
++            approval: sourceYieldedApproval,
++            reason: "stale",
++          },
++        ],
++        allApprovals: [sourceYieldedApproval],
++      };
++    },
++    recoveredContinuationDependencies: {
++      canRecover: async () => false,
++    },
++    onDeferredRecoverySettled: onSettled,
++  });
++
++  expect(runtime.approvalRecoveryDeferred).toBe(true);
++  expect(runtime.turnLifecycle.kind).toBe("idle");
++  expect(scheduleRetry).toHaveBeenCalledTimes(1);
++  expect(onSettled).not.toHaveBeenCalled();
++  expect(runtime.listener.conversationRuntimes.get(runtime.key)).toBe(runtime);
++});
++
+ async function sync(
+   runtime: ConversationRuntime,
+   transport: MockTransport,
+diff --git a/src/websocket/listener/sync-replay.ts b/src/websocket/listener/sync-replay.ts
+index f0fe6ed01..60f46d795 100644
+--- a/src/websocket/listener/sync-replay.ts
++++ b/src/websocket/listener/sync-replay.ts
+@@ -5,15 +5,51 @@ import { isDebugEnabled } from "@/utils/debug";
+ import { getOrCreateProcessTransport } from "./connection";
+ import { replaySubscribedConnectionState } from "./connection-state-sync";
+ import { getOrCreateScopedRuntime } from "./conversation-runtime";
++import { scheduleDeferredSyncRecovery } from "./deferred-sync-recovery";
+ import {
+   type RecoveredContinuationDependencies,
+   startRecoveredApprovalContinuation,
+ } from "./recovery";
+ import { recoverApprovalStateForSync } from "./recovery-sync";
++import { getActiveRuntime } from "./runtime";
+ import { handleIncomingMessage } from "./turn";
+ import type { ListenerRuntime, SyncReplayOptions } from "./types";
+ import { scheduleListenerWarmupsAfterSync } from "./warmup";
+ 
++type SyncRecoveryResult = "deferred" | undefined;
++type DeferredRecoveryScheduler = (
++  runtime: ReturnType<typeof getOrCreateScopedRuntime>,
++  retry: () => Promise<boolean>,
++) => void;
++
++function isCurrentRecoveryRuntime(
++  listenerRuntime: ListenerRuntime,
++  runtime: ReturnType<typeof getOrCreateScopedRuntime>,
++  generation: string | null,
++  epoch: number,
++): boolean {
++  const activeRuntime = getActiveRuntime();
++  return (
++    (!activeRuntime || activeRuntime === listenerRuntime) &&
++    (listenerRuntime.connectionGeneration ?? null) === generation &&
++    runtime.approvalRecoveryEpoch === epoch &&
++    listenerRuntime.conversationRuntimes.get(runtime.key) === runtime
++  );
++}
++
++function isCurrentRecoveryAttempt(
++  listenerRuntime: ListenerRuntime,
++  runtime: ReturnType<typeof getOrCreateScopedRuntime>,
++  generation: string | null,
++  epoch: number,
++  attempt: number,
++): boolean {
++  return (
++    isCurrentRecoveryRuntime(listenerRuntime, runtime, generation, epoch) &&
++    runtime.approvalRecoveryAttempt === attempt
++  );
++}
++
+ /**
+  * Everything the listener does when a connection sends `sync` (or a
+  * `runtime_start` asks for the same replay): recover backend approval state
+@@ -35,6 +71,9 @@ export async function replaySyncStateForRuntime(
+       runtime: ListenerRuntime,
+       scope: RuntimeScope<string | null>,
+     ) => void;
++    scheduleDeferredRecovery?: DeferredRecoveryScheduler;
++    onDeferredRecoverySettled?: () => void;
++    scheduleDeferredRecoveryRetry?: boolean;
+   },
+ ): Promise<void> {
+   const syncScopedRuntime = getOrCreateScopedRuntime(
+@@ -44,15 +83,68 @@ export async function replaySyncStateForRuntime(
+   );
+   const recoverFn =
+     opts?.recoverApprovalStateForSync ?? recoverApprovalStateForSync;
++  const scheduleRecoveryRetry = (): void => {
++    (opts?.scheduleDeferredRecovery ?? scheduleDeferredSyncRecovery)(
++      syncScopedRuntime,
++      async () => {
++        const retryGeneration = listenerRuntime.connectionGeneration ?? null;
++        const retryEpoch = syncScopedRuntime.approvalRecoveryEpoch;
++        if (
++          !isCurrentRecoveryRuntime(
++            listenerRuntime,
++            syncScopedRuntime,
++            retryGeneration,
++            retryEpoch,
++          )
++        ) {
++          return true;
++        }
++        await replaySyncStateForRuntime(listenerRuntime, socket, scope, {
++          ...opts,
++          scheduleDeferredRecoveryRetry: false,
++          onDeferredRecoverySettled: undefined,
++        });
++        if (
++          !isCurrentRecoveryRuntime(
++            listenerRuntime,
++            syncScopedRuntime,
++            retryGeneration,
++            retryEpoch,
++          )
++        ) {
++          return true;
++        }
++        if (syncScopedRuntime.approvalRecoveryDeferred) return false;
++        opts?.onDeferredRecoverySettled?.();
++        return true;
++      },
++    );
++  };
+   // Recovery runs only when the sender asked for it. cloud-api's readiness
+   // probes and activity claims send recover_approvals=false so a prewarmed or
+   // idle sandbox never touches a conversation it merely observes.
++  let recoveryResult: SyncRecoveryResult;
++  let notifyRecoverySettled = false;
++  let recoveryGeneration: string | null | undefined;
++  let recoveryEpoch: number | undefined;
++  let recoveryAttempt: number | undefined;
+   if (opts?.recoverApprovals ?? true) {
++    recoveryGeneration = listenerRuntime.connectionGeneration ?? null;
++    recoveryEpoch = syncScopedRuntime.approvalRecoveryEpoch;
++    recoveryAttempt = ++syncScopedRuntime.approvalRecoveryAttempt;
++    // Fence ingress before the first ownership read. A conflict path clears
++    // recovered state and may otherwise evict this idle runtime before it can
++    // record that recovery was inconclusive.
++    syncScopedRuntime.approvalRecoveryDeferred = true;
+     try {
+-      await recoverFn(syncScopedRuntime, scope, undefined, {
+-        resumeInterruptedTurn: opts?.resumeInterruptedTurn === true,
+-      });
++      recoveryResult =
++        (await recoverFn(syncScopedRuntime, scope, undefined, {
++          resumeInterruptedTurn: opts?.resumeInterruptedTurn === true,
++        })) === "deferred"
++          ? "deferred"
++          : undefined;
+     } catch (error) {
++      recoveryResult = "deferred";
+       trackBoundaryError({
+         errorType: "listener_sync_recovery_failed",
+         error,
+@@ -62,6 +154,32 @@ export async function replaySyncStateForRuntime(
+         console.warn("[Listen] Sync approval recovery failed:", error);
+       }
+     }
++    if (
++      !isCurrentRecoveryAttempt(
++        listenerRuntime,
++        syncScopedRuntime,
++        recoveryGeneration,
++        recoveryEpoch,
++        recoveryAttempt,
++      )
++    ) {
++      return;
++    }
++    const recoveredContinuationNeedsLease =
++      recoveryResult !== "deferred" &&
++      (syncScopedRuntime.recoveredApprovalState?.autoDecisions?.length ?? 0) >
++        0;
++    syncScopedRuntime.approvalRecoveryDeferred =
++      recoveryResult === "deferred" || recoveredContinuationNeedsLease;
++    if (recoveryResult !== "deferred") {
++      notifyRecoverySettled = true;
++    }
++    if (
++      recoveryResult === "deferred" &&
++      opts?.scheduleDeferredRecoveryRetry !== false
++    ) {
++      scheduleRecoveryRetry();
++    }
+   }
+ 
+   // The execution owner asked to resume and recovery found only replay-unsafe
+@@ -75,6 +193,7 @@ export async function replaySyncStateForRuntime(
+     syncScopedRuntime.recoveredApprovalState &&
+     (syncScopedRuntime.recoveredApprovalState.autoDecisions?.length ?? 0) > 0
+   ) {
++    let recoveryLeaseAcquired = false;
+     let signalLeaseReady!: () => void;
+     let releaseLeaseBarrier!: () => void;
+     const leaseReady = new Promise<void>((resolve) => {
+@@ -92,6 +211,7 @@ export async function replaySyncStateForRuntime(
+         connectionId: opts?.connectionId,
+         dependencies: opts?.recoveredContinuationDependencies,
+         onLeaseAcquired: () => {
++          recoveryLeaseAcquired = true;
+           signalLeaseReady();
+           return leaseBarrier;
+         },
+@@ -109,6 +229,36 @@ export async function replaySyncStateForRuntime(
+     });
+     void recovery.finally(signalLeaseReady).catch(() => {});
+     await leaseReady;
++    const continuationAttemptCurrent =
++      recoveryGeneration !== undefined &&
++      recoveryEpoch !== undefined &&
++      recoveryAttempt !== undefined &&
++      isCurrentRecoveryAttempt(
++        listenerRuntime,
++        syncScopedRuntime,
++        recoveryGeneration,
++        recoveryEpoch,
++        recoveryAttempt,
++      );
++    if (!continuationAttemptCurrent) {
++      notifyRecoverySettled = false;
++    } else if (recoveryLeaseAcquired) {
++      syncScopedRuntime.approvalRecoveryDeferred = false;
++    } else {
++      const recoveryHandled = await recovery.catch(() => false);
++      if (recoveryHandled) {
++        syncScopedRuntime.approvalRecoveryDeferred = false;
++      } else {
++        // Ownership changed between the sync read and continuation claim (or
++        // the local runtime became busy). Restore the ingress fence instead of
++        // releasing ordinary queued input into the unresolved gap.
++        syncScopedRuntime.approvalRecoveryDeferred = true;
++        notifyRecoverySettled = false;
++        if (opts?.scheduleDeferredRecoveryRetry !== false) {
++          scheduleRecoveryRetry();
++        }
++      }
++    }
+     try {
+       await replaySubscribedConnectionState(
+         listenerRuntime,
+@@ -124,6 +274,7 @@ export async function replaySyncStateForRuntime(
+       listenerRuntime,
+       scope,
+     );
++    if (notifyRecoverySettled) opts?.onDeferredRecoverySettled?.();
+     return;
+   }
+ 
+@@ -138,4 +289,5 @@ export async function replaySyncStateForRuntime(
+     listenerRuntime,
+     scope,
+   );
++  if (notifyRecoverySettled) opts?.onDeferredRecoverySettled?.();
+ }
+diff --git a/src/websocket/listener/types.ts b/src/websocket/listener/types.ts
+index a51d35cc2..b47be2ed0 100644
+--- a/src/websocket/listener/types.ts
++++ b/src/websocket/listener/types.ts
+@@ -89,6 +89,8 @@ export type SyncReplayOptions = {
+   forceDeviceStatus?: boolean;
+   onStatusChange?: StartListenerOptions["onStatusChange"];
+   connectionId?: string;
++  /** Called after an ownership-deferred approval sync later becomes conclusive. */
++  onDeferredRecoverySettled?: () => void;
+ };
+ 
+ export interface IncomingMessage {
+@@ -456,6 +458,15 @@ export type ConversationRuntime = {
+   messageQueue: Promise<void>;
+   pendingApprovalResolvers: Map<string, PendingApprovalResolver>;
+   recoveredApprovalState: RecoveredApprovalState | null;
++  /**
++   * Approval recovery observed another owner or could not verify ownership.
++   * New input remains queued until a later sync proves the backend state safe.
++   */
++  approvalRecoveryDeferred: boolean;
++  /** Latest recovery attempt allowed to publish the shared ingress fence. */
++  approvalRecoveryAttempt: number;
++  /** Invalidates timers and in-flight deferred recovery when state is reset. */
++  approvalRecoveryEpoch: number;
+   /**
+    * Teleport whose `teleport_continue` this scope is waiting for, set by the
+    * cloud's destination `runtime_start`. While it is set (and not expired),

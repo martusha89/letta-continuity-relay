@@ -13,7 +13,7 @@ volume:
 
 | Resource | Source | Dockerfile | Public network | Replicas |
 | --- | --- | --- | --- | --- |
-| `discord-bridge` | repository root | `Dockerfile` | enabled | **1** |
+| `discord-bridge` | repository root | `Dockerfile` | not required | **1** |
 | `continuity-listener` | `deploy/continuity-listener` | `Dockerfile` | not required | **1** |
 | `continuity-state` | Railway volume | mount on listener at `/root` | n/a | n/a |
 
@@ -29,8 +29,8 @@ Neither service is horizontally scalable.
 
 In the Template Composer service settings, set **Healthcheck Path** to `/ready`
 and **Healthcheck Timeout** to `120` seconds for the first Discord login. The
-Docker image's own `/health` check is only container liveness; it does not
-replace Railway's `/ready` deployment gate.
+Docker image uses the same `/ready` gate. Public networking is unnecessary for
+the beginner deployment; listener traffic stays on Railway's private network.
 
 ### Required user inputs
 
@@ -52,6 +52,7 @@ DISCORD_BRIDGE_BEARER_TOKEN=${{secret(64)}}
 DISCORD_ALLOWED_DM_USER_IDS=
 DISCORD_ALLOWED_MENTION_USER_IDS=
 DISCORD_ALLOWED_MENTION_ROLE_IDS=
+DISCORD_BRIDGE_ALL_MESSAGE_GUILD_IDS=
 DISCORD_BRIDGE_PROACTIVE_DESTINATIONS_JSON=
 DISCORD_BRIDGE_DM_USER_IDS=
 DISCORD_BRIDGE_ROLE_IDS=
@@ -68,9 +69,14 @@ the Discord token or either bearer token in another field.
 - `DISCORD_BRIDGE_BOT_COOLDOWN_MS`: per-bot/channel ingress cooldown, from
   1,000 to 3,600,000 milliseconds (default 30,000). Bots can reach ingress only
   inside the existing Discord permission and routed-channel boundary, and only
-  by directly mentioning the relay; bot replies, role mentions,
-  `@everyone`/`@here`, ambient chatter, DMs, self messages, webhooks, and system
-  messages stay blocked.
+  by directly mentioning the relay or directly replying to a relay-authored
+  message. Replies to anyone else, role mentions, `@everyone`/`@here`, ambient
+  chatter, DMs, self messages, webhooks, and system messages stay blocked.
+- `DISCORD_BRIDGE_ALL_MESSAGE_GUILD_IDS`: advanced trusted-room mode. Human and
+  companion-bot messages in explicitly listed guilds may enter without a
+  mention, but only through the normal allowed-channel boundary. Keep empty
+  until the safe default passes; self, webhook, system, unlisted-guild, and
+  unlisted-channel messages remain blocked.
 - `DISCORD_BRIDGE_ALLOW_EVERYONE`: keep `false` unless every `@everyone` and
   `@here` message should enter the selected agent conversation.
 - `DISCORD_ALLOWED_MENTION_USER_IDS`: users/bots the MCP may deliberately ping.
@@ -90,9 +96,10 @@ outbound identity mapping must be validated separately before exposure.
 
 Attach `continuity-state` at `/root`. In the Template Composer service settings,
 set **Healthcheck Path** to `/ready` and **Healthcheck Timeout** to `180`
-seconds for process startup. `/ready` proves only that the Letta child spawned
-and has not exited; it does not prove channel, mod, or end-to-end message
-delivery. The image's Docker `/health` check is bootstrap-process liveness only.
+seconds for process startup. `/ready` proves only that the Letta child spawned,
+survived its startup grace period, and has not exited; it does not prove
+channel, mod, or end-to-end message delivery. The Docker healthcheck uses this
+same `/ready` endpoint.
 
 ### Required user inputs
 
@@ -115,9 +122,11 @@ LETTA_LOCAL_BACKEND_EXPERIMENTAL=0
 TELEGRAM_ACCOUNT_ID=continuity-main
 TELEGRAM_DISPLAY_NAME=Continuity Telegram
 TELEGRAM_RICH_MESSAGES=false
+DISCORD_CHANNEL_ID=continuity-discord
 DISCORD_ACCOUNT_ID=continuity-main
 DISCORD_DISPLAY_NAME=Continuity Discord
-DISCORD_BRIDGE_BASE_URL=http://${{discord-bridge.RAILWAY_PRIVATE_DOMAIN}}:${{discord-bridge.PORT}}
+DISCORD_CHANNEL_CONVERSATION_OVERRIDES={}
+DISCORD_BRIDGE_BASE_URL=http://${{discord-bridge.RAILWAY_PRIVATE_DOMAIN}}:3001
 DISCORD_BRIDGE_BEARER_TOKEN=${{discord-bridge.DISCORD_BRIDGE_BEARER_TOKEN}}
 DISCORD_CHANNEL_IDS=${{discord-bridge.DISCORD_ALLOWED_CHANNEL_IDS}}
 ```
@@ -158,8 +167,10 @@ user deploys. Do not market this as zero-configuration.
 - Bridge delivery is currently best-effort and in-memory. A service restart
   can lose unacknowledged events; a crash between Letta acceptance and bridge
   acknowledgement can redeliver one event.
-- Every Telegram and Discord route must target the same agent ID and exact
-  conversation ID. This is what creates cross-channel continuity.
+- Every Telegram and Discord route targets the same agent ID. The beginner
+  template also uses the same `default` conversation everywhere. Advanced
+  operators may use strict `DISCORD_CHANNEL_CONVERSATION_OVERRIDES` entries for
+  explicitly separated rooms without changing Telegram's conversation.
 - The reply-route guard is mandatory when multiple channels share one
   conversation. It prevents a stale `MessageChannel` schema from sending a
   reply back to the preceding platform. The guard must resolve the active
@@ -168,7 +179,13 @@ user deploys. Do not market this as zero-configuration.
 - Letta's public documentation currently describes custom CLI channels as a
   local-backend surface. This cloud-agent listener is an advanced,
   self-managed community pattern and must remain version-pinned and regression
-  tested.
+  tested. The listener installs a checksummed custom Letta Code 0.34.24 package
+  with its exact patch, shrinkwrap, provenance, and Apache-2.0 license retained.
+- Addressed attachments are fetched only from Discord's HTTPS attachment CDN,
+  without redirects, into mode-0700 per-process temporary storage. The adapter
+  enforces a maximum of ten files and 20 MiB total. Only signature-verified
+  PNG/JPEG/GIF/WebP bodies are materialized; unsupported or spoofed types stay
+  metadata-only. Temporary files are cleaned up after success and failure.
 - A listener volume causes brief redeploy downtime because the old and new
   deployments cannot mount the same volume simultaneously. Healthchecks going
   green still do not prove Telegram, Discord, or model routing end to end.
@@ -184,9 +201,10 @@ template documentation:
 3. Leave `discord-bridge` at the repository root. Set
    `continuity-listener`'s service root directory to
    `deploy/continuity-listener`.
-4. For `discord-bridge`, select the root `Dockerfile`, enable HTTP public
-   networking, click **Generate Domain**, set `/ready` plus a 120-second
-   Healthcheck Timeout, and add the bridge variables above.
+4. For `discord-bridge`, select the root `Dockerfile`, keep HTTP public
+   networking off, set `/ready` plus a 120-second Healthcheck Timeout, and add
+   the bridge variables above. Generate a public domain only for a separate,
+   explicitly trusted administrative MCP use case.
 5. For `continuity-listener`, use the `Dockerfile` inside its service root, set
    `/ready` plus a 180-second Healthcheck Timeout, and add the listener
    variables/references above. Public networking is unnecessary for this

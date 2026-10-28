@@ -1,9 +1,25 @@
-.git
-.github
-.letta
-node_modules
-build
-.env
-config.json
-*.log
-test
+# Root builds are intentionally allowlisted. A forgotten local file must not
+# enter either production image merely because Docker can see the repository.
+**
+!package.json
+!package-lock.json
+!tsconfig.json
+!src/
+!src/**
+!deploy/
+!deploy/continuity-listener/
+!deploy/continuity-listener/entrypoint.mjs
+!deploy/continuity-listener/channel-reply-route-guard.ts
+!deploy/continuity-listener/proactive-discord.ts
+!deploy/continuity-listener/proactive-telegram.ts
+!deploy/continuity-listener/continuity-discord/
+!deploy/continuity-listener/continuity-discord/plugin.mjs
+!deploy/continuity-listener/container-entrypoint.sh
+!deploy/continuity-listener/vendor/
+!deploy/continuity-listener/vendor/letta-code/
+!deploy/continuity-listener/vendor/letta-code/letta-ai-letta-code-0.34.24.tgz
+!deploy/continuity-listener/vendor/letta-code/SHA256SUMS
+!deploy/continuity-listener/vendor/letta-code/provenance.json
+!deploy/continuity-listener/vendor/letta-code/git-diff.patch
+!deploy/continuity-listener/vendor/letta-code/PROVENANCE.md
+!deploy/continuity-listener/vendor/letta-code/LICENSE

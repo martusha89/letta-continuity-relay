@@ -67,13 +67,21 @@ The template generates separate MCP and bridge secrets, wires the listener to
 the bridge over private networking, attaches persistent state at `/root`, and
 creates exact routes into the same agent/default conversation.
 
-After deployment, verify all five legs before relying on it:
+For the beginner-safe walkthrough—from BotFather and Discord permissions
+through restart tests—follow
+[`deploy/railway-template/setup-guide.md`](deploy/railway-template/setup-guide.md).
+
+After deployment, verify every leg before relying on it:
 
 1. Telegram → agent → Telegram.
 2. Direct Discord bot mention → agent → same Discord channel.
 3. Immediate switch back to Telegram with no reply spillover.
 4. Rapid switch between two allowlisted Discord channels, if configured.
 5. Native Discord typing while the agent is processing.
+6. One small addressed PNG/JPEG/GIF/WebP attachment reaches the agent without
+   leaking a temporary file or accepting a non-Discord URL.
+7. An approval-gated action can be approved and the waiting turn continues.
+8. Restart each service independently, then repeat Telegram and Discord.
 
 Green healthchecks are not an end-to-end test.
 
@@ -93,11 +101,24 @@ default. Optional role mentions and `@everyone`/`@here` triggers are explicit,
 separate opt-ins. Discord DMs remain disabled in the beginner template.
 
 Bots already present inside the Discord permission boundary and an allowed,
-routed channel may address the relay only by **directly mentioning its bot user**.
-Replies, roles, `@everyone`/`@here`, ambient bot chatter, the relay's own
-messages, webhooks, system messages, and bot DMs remain blocked. Accepted bot
-messages also receive a per-bot/channel cooldown, and the listener permits at
-most one unpinged outbound response for each bot-origin message.
+routed channel may address the relay by **directly mentioning its bot user** or
+by directly replying to a relay-authored message. Replies to anyone else,
+roles, `@everyone`/`@here`, ambient bot chatter, the relay's own messages,
+webhooks, system messages, and bot DMs remain blocked. Accepted bot messages
+also receive a per-bot/channel cooldown, and the listener permits at most one
+unpinged outbound response for each bot-origin message.
+
+`DISCORD_BRIDGE_ALL_MESSAGE_GUILD_IDS` is an advanced trusted-room mode. When
+an explicitly listed guild is also inside the normal guild/channel allowlists,
+human and companion-bot messages there may enter without a mention. It is empty
+by default; webhooks, system messages, self messages, unlisted guilds, and
+unlisted channels remain blocked. Turn it on only after the safe default passes.
+
+Addressed Discord attachments are fetched only from Discord's HTTPS CDN,
+without redirects, under a ten-file/20 MiB total ceiling. Only
+signature-verified PNG/JPEG/GIF/WebP bodies are materialized, inside a private
+per-process temporary directory; unsupported or spoofed types remain metadata
+only. Temporary files are removed after success or failure.
 
 ## Administrative Discord MCP tools
 
@@ -109,7 +130,8 @@ through its channel adapter and deliberate outreach through
 `proactive_discord_send`.
 
 If a separate trusted administrative agent or human-operated MCP client needs
-the full Discord tool surface, generate a public domain for `discord-bridge`,
+the full Discord tool surface, deliberately generate a public domain for
+`discord-bridge` (the beginner template does not),
 use:
 
 ```text
@@ -207,7 +229,9 @@ Safety model:
 ## Security and delivery model
 
 - Exact guild/channel and Telegram-user allowlists fail closed.
-- Unknown/self bot, webhook, system, and unaddressed Discord messages are ignored.
+- Self messages, webhooks, system messages, unaddressed messages outside
+  trusted-room mode, and messages outside the exact guild/channel boundary are
+  ignored.
 - The bridge secret is distinct from the public MCP credential.
 - Account and route files are atomic, root-owned, and mode `0600`; malformed,
   conflicting, symlinked, or unsafe state aborts startup rather than being
@@ -233,7 +257,9 @@ docker build -f deploy/continuity-listener/Dockerfile -t continuity-listener dep
 ```
 
 CI tests Node 20 and 22 and builds both images. The listener itself pins Node
-22.19.0 by digest and `@letta-ai/letta-code@0.32.12`.
+22.23.4 by digest and installs the vendored, checksummed custom
+`@letta-ai/letta-code@0.34.24` build documented in
+[`deploy/continuity-listener/vendor/letta-code/PROVENANCE.md`](deploy/continuity-listener/vendor/letta-code/PROVENANCE.md).
 
 The exact Railway Template Composer contract is in
 [`deploy/railway-template/template-spec.md`](deploy/railway-template/template-spec.md).

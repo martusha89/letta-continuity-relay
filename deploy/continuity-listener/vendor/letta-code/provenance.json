@@ -1,0 +1,12 @@
+{
+  "package": "@letta-ai/letta-code",
+  "version": "0.34.24",
+  "artifactKind": "custom-patched-npm-tarball",
+  "upstreamRepository": "https://github.com/letta-ai/letta-code",
+  "upstreamTag": "v0.34.24",
+  "upstreamCommit": "6f4e4886c",
+  "patch": "git-diff.patch",
+  "patchSha256": "9690355d57a4324b89e8b5d97d2c1fbc76ef819d4bac70ef8c6f3426c3cb5c35",
+  "artifactSha256": "3b347b7c220d137c7dcc6792c6f5972b173137d19c0f83f902d9de2b23f0088c",
+  "statement": "This is a custom patched build derived from upstream tag v0.34.24 at commit 6f4e4886c; it is not the npm registry artifact."
+}

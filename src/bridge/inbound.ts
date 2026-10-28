@@ -106,7 +106,7 @@ export function toInboundMessage(
 export function gateInbound(
   view: InboundMessageView,
   policy: AccessPolicy,
-  bridge: Pick<BridgeConfig, "dmUserIds" | "channelIds" | "roleIds" | "allowEveryone">,
+  bridge: Pick<BridgeConfig, "dmUserIds" | "channelIds" | "allMessageGuildIds" | "roleIds" | "allowEveryone">,
   botUserId: string,
 ): GateResult {
   if (view.webhookId !== null) return ignore("webhook_author");
@@ -114,6 +114,9 @@ export function gateInbound(
   if (!view.author) return ignore("system_author");
   const authorIsBot = view.author.bot === true;
   if (authorIsBot && view.author.id === botUserId) return ignore("bot_author");
+  const trustedAllMessageGuild = !view.isDM &&
+    view.guildId !== null &&
+    bridge.allMessageGuildIds.includes(view.guildId);
 
   if (view.isDM) {
     // Companion bots are never admitted through DMs, even if a human with the
@@ -149,10 +152,17 @@ export function gateInbound(
     }
   }
 
+  if (trustedAllMessageGuild) {
+    return { verdict: "deliver", message: toInboundMessage(view, botUserId) };
+  }
+
   if (authorIsBot) {
-    // Bots get exactly one addressing mechanism. Replies, role mentions,
-    // @everyone/@here, and ambient chatter never wake the relay.
-    if (!view.mentionsUserIds.includes(botUserId)) return ignore("bot_direct_mention_required");
+    // Bots may directly address the relay by user mention or by replying to one
+    // of its messages. Role/everyone mentions and ambient chatter stay blocked.
+    const directlyAddressed =
+      view.mentionsUserIds.includes(botUserId) ||
+      (view.referencedMessageId !== null && view.referencedAuthorId === botUserId);
+    if (!directlyAddressed) return ignore("bot_direct_address_required");
     return {
       verdict: "deliver",
       message: toInboundMessage(view, botUserId),
