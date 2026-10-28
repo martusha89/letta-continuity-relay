@@ -14,7 +14,7 @@ COPY vendor/letta-code /opt/vendor/letta-code
 RUN cd /opt/vendor/letta-code \
   && sha256sum --check SHA256SUMS \
   && npm install --global ./letta-ai-letta-code-0.34.24.tgz \
-  && test "$(letta --version)" = "0.34.24" \
+  && test "$(letta --version)" = "0.34.24 (Letta Code)" \
   && rm -rf /opt/vendor/letta-code
 
 WORKDIR /app
