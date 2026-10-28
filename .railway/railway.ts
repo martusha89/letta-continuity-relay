@@ -19,9 +19,9 @@ export default defineRailway(() => {
     healthcheckTimeout: 120,
     replicas: 1,
     deploy: {
-      // Railway's template serializer needs an explicit empty schedule to
+      // Railway's template serializer needs an explicit null schedule to
       // distinguish an ordinary always-on service from an unconfigured cron.
-      cronSchedule: "",
+      cronSchedule: null,
       restartPolicyType: "ON_FAILURE",
       restartPolicyMaxRetries: 10,
     },
@@ -65,8 +65,8 @@ export default defineRailway(() => {
     healthcheckTimeout: 180,
     replicas: 1,
     deploy: {
-      // See the bridge service note above. An empty string means no cron.
-      cronSchedule: "",
+      // See the bridge service note above. Null means no cron.
+      cronSchedule: null,
       restartPolicyType: "ON_FAILURE",
       restartPolicyMaxRetries: 10,
       overlapSeconds: 0,
