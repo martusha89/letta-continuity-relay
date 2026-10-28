@@ -11,10 +11,14 @@ each reply back to the exact platform/channel that originated it.
 > a cloud-hosted agent and must be regression-tested after every Letta Code
 > upgrade.
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template/OpRbiK)
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/new/template/Mvs6I8)
 
 > The Railway template is currently **unpublished and experimental**. The link
 > is shareable, but it has not been submitted to Railway's template marketplace.
+>
+> Railway may show **“Cron configuration needed”** until you save each
+> service's required values. That is a Railway display bug for unconfigured
+> always-on services; do not add a cron schedule.
 
 ## What the template deploys
 
@@ -52,7 +56,7 @@ Telegram or Discord bot token already running in another listener.
 ## Railway deployment
 
 Open the [unpublished Letta Continuity Relay
-template](https://railway.com/new/template/OpRbiK). Railway will ask only for
+template](https://railway.com/new/template/Mvs6I8). Railway will ask only for
 the credentials and IDs it cannot create safely:
 
 - `LETTA_API_KEY`

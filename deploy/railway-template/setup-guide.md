@@ -5,7 +5,7 @@ Telegram bot and tightly allowlisted Discord channels.
 
 Start here:
 
-**https://railway.com/new/template/OpRbiK**
+**https://railway.com/new/template/Mvs6I8**
 
 Railway should ask you for exactly seven values. Everything else is fixed,
 generated, or connected privately by the template:
@@ -101,7 +101,7 @@ pass.
 
 ## 5. Deploy the template
 
-1. Open **https://railway.com/new/template/OpRbiK**.
+1. Open **https://railway.com/new/template/Mvs6I8**.
 2. Confirm the template contains exactly:
    - `discord-bridge`
    - `continuity-listener`
