@@ -41,7 +41,7 @@ test("Railway authoring exposes exactly seven human inputs and two generated cre
 test("Railway topology remains private, single-replica, persistent, and always-on", () => {
   assert.equal((railwaySource.match(/\bservice\(/g) ?? []).length, 2);
   assert.equal((railwaySource.match(/\bvolume\(/g) ?? []).length, 1);
-  assert.equal((railwaySource.match(/cronSchedule: ""/g) ?? []).length, 2);
+  assert.equal((railwaySource.match(/cronSchedule: null/g) ?? []).length, 2);
   assert.equal((railwaySource.match(/replicas: 1/g) ?? []).length, 2);
   assert.match(railwaySource, /"\/root": state/);
   assert.match(railwaySource, /resources: \[bridge, listener, state\]/);
