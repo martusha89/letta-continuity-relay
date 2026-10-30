@@ -80,13 +80,23 @@ test("proactive destination registry is empty by default and parsed when provide
         channelId: "22222222222222222",
         mentions: { marta: { kind: "user", id: "33333333333333333" } },
       },
+      "tiff.dm": {
+        kind: "dm",
+        userId: "44444444444444444",
+      },
     }),
   });
-  assert.equal(configured.bridge.proactiveDestinations.size, 1);
+  assert.equal(configured.bridge.proactiveDestinations.size, 2);
   const porch = configured.bridge.proactiveDestinations.get("aidhd.porch");
+  assert.equal(porch.kind, "channel");
   assert.equal(porch.guildId, "11111111111111111");
   assert.equal(porch.channelId, "22222222222222222");
   assert.deepEqual(porch.mentions.get("marta"), { kind: "user", id: "33333333333333333" });
+  assert.deepEqual(configured.bridge.proactiveDestinations.get("tiff.dm"), {
+    alias: "tiff.dm",
+    kind: "dm",
+    userId: "44444444444444444",
+  });
 
   // Malformed registries fail closed at config load.
   assert.throws(() => loadConfig({ ...base, DISCORD_BRIDGE_PROACTIVE_DESTINATIONS_JSON: "{oops" }), /strict JSON/);

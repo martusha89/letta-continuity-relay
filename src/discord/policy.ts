@@ -39,11 +39,11 @@ export function isChannelDiscoverable(
       Boolean(channel.parentId && policy.allowedChannelIds.includes(channel.parentId)));
 }
 
-export function assertDmAllowed(policy: AccessPolicy, userId: string): void {
+export function assertDmAllowed(policy: { readonly allowedDmUserIds: readonly string[] }, userId: string): void {
   if (!policy.allowedDmUserIds.includes(userId)) throw new PolicyError("DM recipient is not allowed by policy");
 }
 
-export function assertMentionUsersAllowed(policy: AccessPolicy, userIds: readonly string[]): string[] {
+export function assertMentionUsersAllowed(policy: { readonly allowedMentionUserIds: readonly string[] }, userIds: readonly string[]): string[] {
   const unique = [...new Set(userIds)];
   for (const userId of unique) {
     if (!/^\d{17,20}$/.test(userId) || !policy.allowedMentionUserIds.includes(userId)) {
@@ -53,7 +53,7 @@ export function assertMentionUsersAllowed(policy: AccessPolicy, userIds: readonl
   return unique;
 }
 
-export function assertMentionRolesAllowed(policy: AccessPolicy, roleIds: readonly string[]): string[] {
+export function assertMentionRolesAllowed(policy: { readonly allowedMentionRoleIds: readonly string[] }, roleIds: readonly string[]): string[] {
   const unique = [...new Set(roleIds)];
   for (const roleId of unique) {
     if (!/^\d{17,20}$/.test(roleId) || !policy.allowedMentionRoleIds.includes(roleId)) {

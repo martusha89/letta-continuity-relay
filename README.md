@@ -169,12 +169,12 @@ is reported as unknown and is never retried automatically.
 ## Proactive named destinations (bridge configuration)
 
 The bridge can expose a `proactive_send` action on `POST /bridge/send` that
-lets the agent deliberately initiate a Discord message at a **named
-destination** — even when the current turn arrived through another channel or
-has no inbound route. Raw Discord IDs never travel to the agent; the bridge
-owns the only copy of them.
+lets the agent deliberately initiate a Discord message at a **named guild
+channel or direct-message destination** — even when the current turn arrived
+through another channel or has no inbound route. Raw Discord IDs never travel
+to the agent; the bridge owns the only copy of them.
 
-Configure three bridge-side values:
+Configure these bridge-side values:
 
 - `DISCORD_BRIDGE_PROACTIVE_DESTINATIONS_JSON` — strict JSON registry of
   named destinations. Empty or omitted means the feature is simply off.
@@ -182,6 +182,8 @@ Configure three bridge-side values:
   deliberately ping (the existing user mention allowlist).
 - `DISCORD_ALLOWED_MENTION_ROLE_IDS` — roles a proactive destination may
   deliberately ping (new, comma-separated, empty by default).
+- `DISCORD_ALLOWED_DM_USER_IDS` — exact users a proactive DM destination may
+  message. Keep empty unless a specific private recipient is approved.
 
 Example registry:
 
@@ -194,9 +196,19 @@ Example registry:
       "marta": { "kind": "user", "id": "333333333333333333" },
       "boys":  { "kind": "role", "id": "666666666666666666" }
     }
+  },
+  "tiff.dm": {
+    "kind": "dm",
+    "userId": "777777777777777777"
   }
 }
 ```
+
+Existing guild-channel entries may omit `"kind": "channel"` for backwards
+compatibility. DM entries require explicit `"kind": "dm"`, accept only a
+single `userId`, and never accept mention aliases. The DM user must also be in
+`DISCORD_ALLOWED_DM_USER_IDS`; adding a proactive DM does not enable inbound DM
+routing or add the user to `DISCORD_BRIDGE_DM_USER_IDS`.
 
 The agent-facing `proactive_discord_send` tool accepts only:
 
@@ -206,7 +218,8 @@ The agent-facing `proactive_discord_send` tool accepts only:
 
 The listener adds a private UUID idempotency key when it calls the bridge. A
 retry within the bridge's bounded ten-minute cache returns the original receipt
-instead of posting twice.
+instead of posting twice. Reusing that UUID with different destination, text,
+or mentions is rejected rather than silently returning the wrong receipt.
 
 Safety model:
 
@@ -224,11 +237,15 @@ Safety model:
   tools: `@everyone`/`@here` parsing stays suppressed, `repliedUser` stays
   `false`, and `allowedMentions` is assigned last so no `extra` option can
   override it.
-- At startup — after Discord login — every configured destination is verified:
-  the guild and policy-allowed channel must exist, the bot must be able to view
-  and send there, user aliases must resolve to members of that guild, and role
-  aliases must resolve to globally allowlisted, non-managed, mentionable roles.
-  Any mismatch aborts startup. There is no fuzzy fallback.
+- At startup — after Discord login — every configured destination is verified.
+  For channels, the guild and policy-allowed channel must exist, the bot must
+  be able to view and send there, user aliases must resolve to members of that
+  guild, and role aliases must resolve to globally allowlisted, non-managed,
+  mentionable roles. For DMs, the exact user identity must exist and pass the
+  outbound DM allowlist. This identity check cannot prove that the user's
+  privacy settings will accept a message; only a successful send receipt proves
+  delivery. Any configuration mismatch aborts startup. There is no fuzzy
+  fallback.
 
 ## Security and delivery model
 

@@ -34,6 +34,7 @@ export function createBridgeSendHandlers(
   const proactiveRequests = new Map<string, {
     createdAt: number;
     settled: boolean;
+    fingerprint: string;
     promise: ReturnType<BridgeSendHandlers["proactiveSend"]>;
   }>();
   const proactiveTtlMs = 10 * 60_000;
@@ -72,8 +73,18 @@ export function createBridgeSendHandlers(
     proactiveSend: async action => {
       const now = Date.now();
       pruneProactiveRequests(now);
+      const fingerprint = JSON.stringify([
+        action.destination,
+        action.text,
+        action.mentions ?? [],
+      ]);
       const existing = proactiveRequests.get(action.requestId);
-      if (existing) return existing.promise;
+      if (existing) {
+        if (existing.fingerprint !== fingerprint) {
+          throw new Error("Proactive request ID was reused with different content");
+        }
+        return existing.promise;
+      }
       if (proactiveRequests.size >= proactiveLimit) {
         throw new Error("Proactive send capacity is temporarily exhausted");
       }
@@ -82,18 +93,24 @@ export function createBridgeSendHandlers(
         // allowlists, and the mention tokens are all composed here. The caller
         // never supplies tokens or raw IDs, and unknown aliases fail closed.
         const target = resolveProactiveTarget(cfg.bridge.proactiveDestinations, cfg.policy, action.destination, action.mentions ?? []);
-        const tokens = composeMentionTokens(target.mentionUserIds, target.mentionRoleIds);
-        const content = tokens.length > 0 ? `${tokens.join(" ")} ${action.text}` : action.text;
-        // The existing safe send path re-validates the channel against the
-        // outbound policy and re-validates every mention against the allowlists,
-        // with allowedMentions assigned last (cannot be overridden).
-        const result = await operations.sendMessage({
-          channel: target.channelId,
-          content,
-          mentionUserIds: target.mentionUserIds,
-          mentionRoleIds: target.mentionRoleIds,
-          limits: cfg.limits,
-        });
+        const result = target.kind === "dm"
+          ? await operations.sendDirectMessage({
+              userId: target.userId,
+              content: action.text,
+              limits: cfg.limits,
+            })
+          : await operations.sendMessage({
+              // The existing safe channel path re-validates the destination
+              // and every mention, with allowedMentions assigned last.
+              channel: target.channelId,
+              content: (() => {
+                const tokens = composeMentionTokens(target.mentionUserIds, target.mentionRoleIds);
+                return tokens.length > 0 ? `${tokens.join(" ")} ${action.text}` : action.text;
+              })(),
+              mentionUserIds: target.mentionUserIds,
+              mentionRoleIds: target.mentionRoleIds,
+              limits: cfg.limits,
+            });
         return {
           messageId: result.id,
           channelId: result.channelId,
@@ -101,7 +118,7 @@ export function createBridgeSendHandlers(
           requestId: action.requestId,
         };
       });
-      const entry = { createdAt: now, settled: false, promise };
+      const entry = { createdAt: now, settled: false, fingerprint, promise };
       proactiveRequests.set(action.requestId, entry);
       try {
         const result = await promise;
@@ -144,10 +161,10 @@ export function createBridgeRuntime(cfg: RuntimeConfig, client: Client): BridgeR
 
   const sendHandlers = createBridgeSendHandlers(cfg);
 
-  // After Discord login, verify every configured proactive destination
-  // resolves to an allowed sendable channel in its configured guild, and that
-  // configured mentions belong to that guild where Discord permits
-  // verification. Any mismatch fails startup — no fuzzy fallback.
+  // After Discord login, verify every configured proactive destination. Guild
+  // destinations must resolve to allowed sendable channels with valid mention
+  // aliases; DM destinations must resolve to known users inside the outbound
+  // DM allowlist. Any mismatch fails startup — no fuzzy fallback.
   const routerOptions: BridgeRouterOptions = {
     bridge: cfg.bridge,
     queue: pipeline.queue,

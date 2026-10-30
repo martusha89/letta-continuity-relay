@@ -91,7 +91,9 @@ the Discord token or either bearer token in another field.
 - `DISCORD_BRIDGE_PROACTIVE_DESTINATIONS_JSON`: strict named-destination
   registry used by the listener's proactive Discord tool. Keep raw Discord IDs
   inside this bridge-side configuration; the agent calls only destination and
-  mention aliases.
+  mention aliases. A DM destination uses `{ "kind": "dm", "userId": "..." }`,
+  accepts no mention aliases, and requires the same user in
+  `DISCORD_ALLOWED_DM_USER_IDS`; it does not enable inbound DM routing.
 - `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID`: only when Discord voice-note
   output is wanted.
 

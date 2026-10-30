@@ -9,17 +9,25 @@
  */
 import { PermissionFlagsBits, type Client } from "discord.js";
 import type { AccessPolicy, ProactiveDestinationRegistry, ProactiveMention } from "../config.js";
-import { assertChannelAllowed, assertMentionRolesAllowed, assertMentionUsersAllowed, PolicyError } from "./policy.js";
+import { assertChannelAllowed, assertDmAllowed, assertMentionRolesAllowed, assertMentionUsersAllowed, PolicyError } from "./policy.js";
 
 const SNOWFLAKE = /^\d{17,20}$/;
 const SENDABLE_CHANNEL_TYPES = new Set([0 /* GuildText */, 5 /* GuildNews */, 11 /* PublicThread */, 12 /* PrivateThread */]);
 
-export interface ResolvedProactiveTarget {
+export interface ResolvedProactiveChannelTarget {
+  kind: "channel";
   guildId: string;
   channelId: string;
   mentionUserIds: string[];
   mentionRoleIds: string[];
 }
+
+export interface ResolvedProactiveDmTarget {
+  kind: "dm";
+  userId: string;
+}
+
+export type ResolvedProactiveTarget = ResolvedProactiveChannelTarget | ResolvedProactiveDmTarget;
 
 export interface DestinationVerifier {
   /** Fetch a guild by exact ID; null when unknown to the client. */
@@ -30,6 +38,8 @@ export interface DestinationVerifier {
   fetchRole(guildId: string, roleId: string): Promise<{ id: string; managed: boolean; mentionable: boolean } | null>;
   /** Fetch a guild member by exact IDs; null when unknown or outside the guild. */
   fetchMember(guildId: string, userId: string): Promise<{ id: string } | null>;
+  /** Fetch a Discord user by exact ID; null when unknown to Discord. */
+  fetchUser(userId: string): Promise<{ id: string } | null>;
   /** Confirm the bot can view and send to the exact destination channel. */
   canSendToChannel(channelId: string): Promise<boolean>;
 }
@@ -81,6 +91,13 @@ export function createClientVerifier(client: Client): DestinationVerifier {
         return null;
       }
     },
+    async fetchUser(userId) {
+      try {
+        return await client.users.fetch(userId);
+      } catch {
+        return null;
+      }
+    },
     async canSendToChannel(channelId) {
       try {
         const channel = await client.channels.fetch(channelId);
@@ -100,9 +117,10 @@ export function createClientVerifier(client: Client): DestinationVerifier {
 
 /**
  * Verify every configured destination against the live Discord client.
- * Throws when any destination is unknown, sits in the wrong guild, is not a
- * sendable channel, or — where Discord permits verification — references a
- * mention that does not belong to the configured guild. No fuzzy fallback.
+ * Throws when any destination identity is unknown, sits in the wrong guild,
+ * is not a sendable channel, violates policy, or references an invalid mention.
+ * DM user lookup verifies identity, not whether privacy settings will allow a
+ * later message; delivery is proven only by a successful send receipt.
  */
 export async function verifyProactiveDestinations(
   registry: ProactiveDestinationRegistry,
@@ -110,6 +128,14 @@ export async function verifyProactiveDestinations(
   policy: AccessPolicy,
 ): Promise<void> {
   for (const destination of registry.values()) {
+    if (destination.kind === "dm") {
+      assertDmAllowed(policy, destination.userId);
+      const user = await verifier.fetchUser(destination.userId);
+      if (!user) {
+        throw new Error(`Proactive destination "${destination.alias}" references an unknown DM user`);
+      }
+      continue;
+    }
     const guild = await verifier.fetchGuild(destination.guildId);
     if (!guild) {
       throw new Error(`Proactive destination "${destination.alias}" references an unknown guild`);
@@ -152,12 +178,21 @@ export async function verifyProactiveDestinations(
  */
 export function resolveProactiveTarget(
   registry: ProactiveDestinationRegistry,
-  policy: { allowedMentionUserIds: readonly string[]; allowedMentionRoleIds: readonly string[] },
+  policy: {
+    allowedDmUserIds: readonly string[];
+    allowedMentionUserIds: readonly string[];
+    allowedMentionRoleIds: readonly string[];
+  },
   destinationAlias: string,
   mentionAliases: readonly string[],
 ): ResolvedProactiveTarget {
   const destination = registry.get(destinationAlias);
   if (!destination) throw new PolicyError("Unknown proactive destination");
+  if (destination.kind === "dm") {
+    if (mentionAliases.length > 0) throw new PolicyError("Proactive DM destinations do not accept mentions");
+    assertDmAllowed(policy, destination.userId);
+    return { kind: "dm", userId: destination.userId };
+  }
   const mentionUserIds: string[] = [];
   const mentionRoleIds: string[] = [];
   for (const alias of mentionAliases) {
@@ -176,6 +211,7 @@ export function resolveProactiveTarget(
     }
   }
   return {
+    kind: "channel",
     guildId: destination.guildId,
     channelId: destination.channelId,
     mentionUserIds: [...new Set(mentionUserIds)],

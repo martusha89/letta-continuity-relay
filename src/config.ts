@@ -18,11 +18,20 @@ const proactiveMentionSchema = z.object({
   kind: z.enum(["user", "role"]),
   id: snowflake,
 }).strict();
-const proactiveDestinationSchema = z.object({
+const proactiveChannelDestinationSchema = z.object({
+  kind: z.literal("channel").optional(),
   guildId: snowflake,
   channelId: snowflake,
   mentions: z.record(z.string(), proactiveMentionSchema).optional(),
 }).strict();
+const proactiveDmDestinationSchema = z.object({
+  kind: z.literal("dm"),
+  userId: snowflake,
+}).strict();
+const proactiveDestinationSchema = z.union([
+  proactiveChannelDestinationSchema,
+  proactiveDmDestinationSchema,
+]);
 
 const fileSchema = z.object({
   elevenlabs: z.object({
@@ -86,13 +95,23 @@ export interface ProactiveMention {
  * A named proactive destination. Callers only ever see the alias; the raw
  * guild/channel/mention IDs never leave the bridge configuration.
  */
-export interface ProactiveDestination {
+export interface ProactiveChannelDestination {
   alias: string;
+  kind: "channel";
   guildId: string;
   channelId: string;
   /** Destination-scoped mention aliases, normalized lowercase. */
   mentions: Map<string, ProactiveMention>;
 }
+
+/** A named direct-message destination. It never accepts mention aliases. */
+export interface ProactiveDmDestination {
+  alias: string;
+  kind: "dm";
+  userId: string;
+}
+
+export type ProactiveDestination = ProactiveChannelDestination | ProactiveDmDestination;
 
 /** Normalized proactive destination registry keyed by normalized alias. */
 export type ProactiveDestinationRegistry = Map<string, ProactiveDestination>;
@@ -255,6 +274,10 @@ export function parseProactiveDestinations(name: string, value: string | undefin
     if (!destination.success) {
       throw new Error(`${name} destination "${alias}" is invalid: ${destination.error.issues.map(i => `${i.path.join(".")}: ${i.message}`).join("; ")}`);
     }
+    if (destination.data.kind === "dm") {
+      registry.set(alias, { alias, kind: "dm", userId: destination.data.userId });
+      continue;
+    }
     const mentions = new Map<string, ProactiveMention>();
     for (const [rawMentionAlias, rawMention] of Object.entries(destination.data.mentions ?? {})) {
       const mentionAlias = normalizeDestinationAlias(rawMentionAlias);
@@ -266,7 +289,13 @@ export function parseProactiveDestinations(name: string, value: string | undefin
       }
       mentions.set(mentionAlias, rawMention);
     }
-    registry.set(alias, { alias, guildId: destination.data.guildId, channelId: destination.data.channelId, mentions });
+    registry.set(alias, {
+      alias,
+      kind: "channel",
+      guildId: destination.data.guildId,
+      channelId: destination.data.channelId,
+      mentions,
+    });
   }
   return registry;
 }

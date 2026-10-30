@@ -8,7 +8,7 @@ import { BoundedIdempotencySet, BridgeEventQueue } from "../build/bridge/queue.j
 import { createBridgeRouter, parseSendAction } from "../build/bridge/router.js";
 import { createBridgeSendHandlers } from "../build/bridge/runtime.js";
 import { parseProactiveDestinations, normalizeDestinationAlias } from "../build/config.js";
-import { resolveProactiveTarget, verifyProactiveDestinations, composeMentionTokens } from "../build/discord/destinations.js";
+import { createClientVerifier, resolveProactiveTarget, verifyProactiveDestinations, composeMentionTokens } from "../build/discord/destinations.js";
 import { buildMessagePayload } from "../build/discord/messages.js";
 import { assertMentionRolesAllowed, assertMentionUsersAllowed } from "../build/discord/policy.js";
 import { createHttpApp } from "../build/http-app.js";
@@ -759,6 +759,10 @@ const REGISTRY_JSON = JSON.stringify({
       boys: { kind: "role", id: BOYS_ROLE_ID },
     },
   },
+  "tiff.dm": {
+    kind: "dm",
+    userId: USER_ID,
+  },
 });
 
 function registryFromEnv(value) {
@@ -767,15 +771,21 @@ function registryFromEnv(value) {
 
 test("proactive destination registry parses strict JSON and normalizes aliases", () => {
   const registry = registryFromEnv(REGISTRY_JSON);
-  assert.equal(registry.size, 1);
+  assert.equal(registry.size, 2);
   const porch = registry.get("aidhd.porch");
   assert.ok(porch);
+  assert.equal(porch.kind, "channel");
   assert.equal(porch.guildId, GUILD_ID);
   assert.equal(porch.channelId, CHANNEL_ID);
   assert.equal(porch.mentions.get("marta").kind, "user");
   assert.equal(porch.mentions.get("marta").id, USER_ID);
   assert.equal(porch.mentions.get("boys").kind, "role");
   assert.equal(porch.mentions.get("boys").id, BOYS_ROLE_ID);
+  assert.deepEqual(registry.get("tiff.dm"), {
+    alias: "tiff.dm",
+    kind: "dm",
+    userId: USER_ID,
+  });
 
   // Mixed-case keys normalize to the same lowercase alias.
   const normalized = registryFromEnv(JSON.stringify({ "AIDHD.PORCH": { guildId: GUILD_ID, channelId: CHANNEL_ID } }));
@@ -817,6 +827,9 @@ test("proactive destination registry rejects malformed and duplicate configurati
   assert.throws(() => registryFromEnv(JSON.stringify({ porch: {} })), /invalid/);
   assert.throws(() => registryFromEnv(JSON.stringify({ porch: { guildId: "nope", channelId: CHANNEL_ID } })), /invalid/);
   assert.throws(() => registryFromEnv(JSON.stringify({ porch: { guildId: GUILD_ID, channelId: CHANNEL_ID, extra: 1 } })), /invalid/);
+  assert.throws(() => registryFromEnv(JSON.stringify({ "tiff.dm": { kind: "dm" } })), /invalid/);
+  assert.throws(() => registryFromEnv(JSON.stringify({ "tiff.dm": { kind: "dm", userId: USER_ID, mentions: {} } })), /invalid/);
+  assert.throws(() => registryFromEnv(JSON.stringify({ "tiff.dm": { kind: "dm", userId: USER_ID, guildId: GUILD_ID } })), /invalid/);
   // Duplicate mention aliases within one destination.
   assert.throws(() => registryFromEnv(JSON.stringify({
     porch: {
@@ -838,18 +851,26 @@ test("proactive destination registry rejects malformed and duplicate configurati
 
 test("resolveProactiveTarget resolves aliases server-side and enforces mention policy", () => {
   const registry = registryFromEnv(REGISTRY_JSON);
-  const allowAll = { allowedMentionUserIds: [USER_ID], allowedMentionRoleIds: [BOYS_ROLE_ID] };
+  const allowAll = { allowedDmUserIds: [USER_ID], allowedMentionUserIds: [USER_ID], allowedMentionRoleIds: [BOYS_ROLE_ID] };
 
   // Successful alias resolution with both mention kinds.
   const resolved = resolveProactiveTarget(registry, allowAll, "aidhd.porch", ["marta", "boys"]);
   assert.deepEqual(resolved, {
+    kind: "channel",
     guildId: GUILD_ID, channelId: CHANNEL_ID,
     mentionUserIds: [USER_ID], mentionRoleIds: [BOYS_ROLE_ID],
   });
 
   // No mentions is fine.
   assert.deepEqual(resolveProactiveTarget(registry, allowAll, "aidhd.porch", []),
-    { guildId: GUILD_ID, channelId: CHANNEL_ID, mentionUserIds: [], mentionRoleIds: [] });
+    { kind: "channel", guildId: GUILD_ID, channelId: CHANNEL_ID, mentionUserIds: [], mentionRoleIds: [] });
+
+  assert.deepEqual(resolveProactiveTarget(registry, allowAll, "tiff.dm", []),
+    { kind: "dm", userId: USER_ID });
+  assert.throws(() => resolveProactiveTarget(registry, allowAll, "tiff.dm", ["marta"]),
+    /do not accept mentions/);
+  assert.throws(() => resolveProactiveTarget(registry, { ...allowAll, allowedDmUserIds: [] }, "tiff.dm", []),
+    /DM recipient is not allowed/);
 
   // Unknown destination fails closed.
   assert.throws(() => resolveProactiveTarget(registry, allowAll, "missing.place", []),
@@ -873,6 +894,7 @@ test("verifyProactiveDestinations fails startup on unknown or mismatched destina
   const registry = registryFromEnv(REGISTRY_JSON);
   const policy = {
     ...POLICY,
+    allowedDmUserIds: [USER_ID],
     allowedMentionUserIds: [USER_ID],
     allowedMentionRoleIds: [BOYS_ROLE_ID],
   };
@@ -883,9 +905,18 @@ test("verifyProactiveDestinations fails startup on unknown or mismatched destina
     fetchSendableChannel: async id => ({ id, guildId: GUILD_ID, parentId: null }),
     fetchRole: async (guildId, roleId) => ({ id: roleId, managed: false, mentionable: true }),
     fetchMember: async (guildId, userId) => ({ id: userId }),
+    fetchUser: async userId => ({ id: userId }),
     canSendToChannel: async () => true,
   };
   await verifyProactiveDestinations(registry, okVerifier, policy);
+
+  // DM identities must exist and remain inside the outbound DM allowlist.
+  await assert.rejects(() => verifyProactiveDestinations(registry, {
+    ...okVerifier, fetchUser: async () => null,
+  }, policy), /unknown DM user/);
+  await assert.rejects(() => verifyProactiveDestinations(registry, okVerifier, {
+    ...policy, allowedDmUserIds: [],
+  }), /DM recipient is not allowed/);
 
   // Unknown guild.
   await assert.rejects(() => verifyProactiveDestinations(registry, {
@@ -927,6 +958,18 @@ test("verifyProactiveDestinations fails startup on unknown or mismatched destina
     ...policy,
     allowedMentionRoleIds: [],
   }), /Mentioned role is not allowed/);
+});
+
+test("client destination verifier resolves DM identities fail-closed", async () => {
+  const known = createClientVerifier({
+    users: { fetch: async id => ({ id }) },
+  });
+  assert.deepEqual(await known.fetchUser(USER_ID), { id: USER_ID });
+
+  const missing = createClientVerifier({
+    users: { fetch: async () => { throw new Error("unknown user"); } },
+  });
+  assert.equal(await missing.fetchUser(USER_ID), null);
 });
 
 test("composeMentionTokens builds role and user tokens server-side", () => {
@@ -985,6 +1028,116 @@ test("proactive runtime handler resolves aliases and sends through the safe path
   });
   assert.deepEqual(repeated, result);
   assert.equal(calls.length, 2, "idempotent retry must not send again");
+});
+
+test("proactive runtime handler sends a named DM through the DM allowlist path", async () => {
+  const registry = registryFromEnv(REGISTRY_JSON);
+  const channelCalls = [];
+  const dmCalls = [];
+  const handlers = createBridgeSendHandlers(
+    {
+      defaults: {},
+      limits: { messageChars: 2000 },
+      policy: {
+        allowedDmUserIds: [USER_ID],
+        allowedMentionUserIds: [],
+        allowedMentionRoleIds: [],
+      },
+      bridge: { proactiveDestinations: registry },
+    },
+    {
+      sendMessage: async options => {
+        channelCalls.push(options);
+        throw new Error("channel send must not be used for a DM destination");
+      },
+      sendDirectMessage: async options => {
+        dmCalls.push(options);
+        return { id: "900000000000000010", channelId: OTHER_CHANNEL, recipient: "tiff" };
+      },
+      reactToMessage: async () => { throw new Error("not used"); },
+      setTyping: async () => { throw new Error("not used"); },
+    },
+  );
+
+  const result = await handlers.proactiveSend({
+    kind: "proactive_send",
+    requestId: "55555555-5555-4555-8555-555555555555",
+    destination: "tiff.dm",
+    text: "Morning from Cass",
+  });
+  assert.deepEqual(result, {
+    messageId: "900000000000000010",
+    channelId: OTHER_CHANNEL,
+    destination: "tiff.dm",
+    requestId: "55555555-5555-4555-8555-555555555555",
+  });
+  assert.equal(channelCalls.length, 0);
+  assert.deepEqual(dmCalls, [{ userId: USER_ID, content: "Morning from Cass", limits: { messageChars: 2000 } }]);
+
+  const repeated = await handlers.proactiveSend({
+    kind: "proactive_send",
+    requestId: "55555555-5555-4555-8555-555555555555",
+    destination: "tiff.dm",
+    text: "Morning from Cass",
+  });
+  assert.deepEqual(repeated, result);
+  assert.equal(dmCalls.length, 1, "an exact DM retry must reuse its receipt");
+
+  for (const mismatched of [
+    { destination: "tiff.dm", text: "Changed text" },
+    { destination: "aidhd.porch", text: "Morning from Cass" },
+    { destination: "tiff.dm", text: "Morning from Cass", mentions: ["marta"] },
+  ]) {
+    await assert.rejects(() => handlers.proactiveSend({
+      kind: "proactive_send",
+      requestId: "55555555-5555-4555-8555-555555555555",
+      ...mismatched,
+    }), /reused with different content/);
+  }
+  assert.equal(dmCalls.length, 1, "mismatched request-ID reuse must never reach Discord");
+
+  await assert.rejects(() => handlers.proactiveSend({
+    kind: "proactive_send",
+    requestId: "66666666-6666-4666-8666-666666666666",
+    destination: "tiff.dm",
+    text: "No mentions in DMs",
+    mentions: ["marta"],
+  }), /do not accept mentions/);
+  assert.equal(dmCalls.length, 1);
+});
+
+test("concurrent proactive DM retries share one in-flight send", async () => {
+  const registry = registryFromEnv(REGISTRY_JSON);
+  let resolveSend;
+  let calls = 0;
+  const handlers = createBridgeSendHandlers({
+    defaults: {},
+    limits: { messageChars: 2000 },
+    policy: { allowedDmUserIds: [USER_ID], allowedMentionUserIds: [], allowedMentionRoleIds: [] },
+    bridge: { proactiveDestinations: registry },
+  }, {
+    sendMessage: async () => { throw new Error("not used"); },
+    sendDirectMessage: async options => {
+      calls += 1;
+      return await new Promise(resolve => {
+        resolveSend = () => resolve({ id: "900000000000000011", channelId: OTHER_CHANNEL, recipient: options.userId });
+      });
+    },
+    reactToMessage: async () => { throw new Error("not used"); },
+    setTyping: async () => { throw new Error("not used"); },
+  });
+  const action = {
+    kind: "proactive_send",
+    requestId: "77777777-7777-4777-8777-777777777777",
+    destination: "tiff.dm",
+    text: "one send",
+  };
+  const first = handlers.proactiveSend(action);
+  const repeated = handlers.proactiveSend(action);
+  await Promise.resolve();
+  assert.equal(calls, 1);
+  resolveSend();
+  assert.deepEqual(await repeated, await first);
 });
 
 test("proactive idempotency expires settled receipts but never evicts an in-flight send", async () => {

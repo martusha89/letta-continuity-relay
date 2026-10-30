@@ -24,10 +24,12 @@ agent to initiate a new Discord message deliberately from a Desktop, scheduled,
 Telegram, or otherwise unrouted turn.
 
 The proactive tool accepts only a configured destination alias (for example
-`aidhd.porch`) plus optional configured mention aliases. It never accepts raw
-Discord channel, user, or role IDs. The bridge resolves and verifies those
-aliases server-side, applies the existing Discord policy allowlists, and returns
-a real Discord message ID. Unknown destinations or mentions fail without a
+`aidhd.porch` or `tiff.dm`) plus optional configured mention aliases for guild
+channels. It never accepts raw Discord channel, user, or role IDs. The bridge
+resolves and verifies those aliases server-side, applies the existing Discord
+policy allowlists, and returns a real Discord message ID. Named DM destinations
+must pass `DISCORD_ALLOWED_DM_USER_IDS`, never accept mentions, and do not
+enable inbound DM routing. Unknown destinations or mentions fail without a
 fallback or history-based guess.
 
 This is intentionally a separate tool rather than an escape hatch in ordinary
